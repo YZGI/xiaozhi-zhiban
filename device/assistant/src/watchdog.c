@@ -177,26 +177,8 @@ static void *watchdog_thread_func(void *arg)
         /* 每60秒输出一次系统资源监控信息 */
         if (monitor_count % 6 == 0)
         {
-            int mem_free = 0, mem_available = 0, mem_cached = 0;
-            FILE *f = fopen("/proc/meminfo", "r");
-            if (f)
-            {
-                char line[256];
-                while (fgets(line, sizeof(line), f))
-                {
-                    if (strncmp(line, "MemFree:", 8) == 0)
-                        sscanf(line + 8, " %d", &mem_free);
-                    else if (strncmp(line, "MemAvailable:", 13) == 0)
-                        sscanf(line + 13, " %d", &mem_available);
-                    else if (strncmp(line, "Cached:", 7) == 0)
-                        sscanf(line + 7, " %d", &mem_cached);
-                }
-                fclose(f);
-            }
-
-            /* 读取进程自身内存使用 */
             int vsz = 0, rss = 0;
-            f = fopen("/proc/self/status", "r");
+            FILE *f = fopen("/proc/self/status", "r");
             if (f)
             {
                 char line[256];
@@ -210,27 +192,7 @@ static void *watchdog_thread_func(void *arg)
                 fclose(f);
             }
 
-            PLOG_I("MEM", "MemFree=%dKB Cached=%dKB VSZ=%dKB RSS=%dKB",
-                   mem_free, mem_cached, vsz, rss);
-
-            /* 低内存警告 */
-            if (mem_free > 0 && mem_free < 1024)
-            {
-                PLOG_W("MEM", "内存不足: MemFree=%dKB < 1024KB!", mem_free);
-            }
-
-            /* 读取CPU负载 */
-            f = fopen("/proc/loadavg", "r");
-            if (f)
-            {
-                char load_buf[128];
-                if (fgets(load_buf, sizeof(load_buf), f))
-                {
-                    load_buf[strcspn(load_buf, "\n")] = 0;
-                    PLOG_I("CPU", "负载均值: %s", load_buf);
-                }
-                fclose(f);
-            }
+            PLOG_I("MEM", "VSZ=%dKB RSS=%dKB", vsz, rss);
         }
 
         sleep(10);

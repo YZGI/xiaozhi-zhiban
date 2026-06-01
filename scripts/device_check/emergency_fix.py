@@ -15,7 +15,7 @@
     python scripts/device_check/emergency_fix.py           # 自适应模式（推荐）
     python scripts/device_check/emergency_fix.py --fast    # 快速重启专用（0.2秒间隔）
     python scripts/device_check/emergency_fix.py --slow    # 慢速重启专用（2秒间隔）
-    python scripts/device_check/emergency_fix.py --all     # 全面修复：删除sair+test.sh+禁止看门狗
+    python scripts/device_check/emergency_fix.py --all     # 全面修复：删除sair+禁止看门狗
 
 注意：设备必须通过 USB 连接到电脑！
 """
@@ -99,8 +99,6 @@ def do_fix(mode):
         fixed = []
         if try_remove_file("/var/upgrade/sair"):
             fixed.append("sair wrapper")
-        if try_remove_file("/var/upgrade/test.sh"):
-            fixed.append("test.sh")
         if try_fix_watchdog_forbid():
             fixed.append("看门狗已禁止")
         return fixed
@@ -117,7 +115,7 @@ def main():
     parser.add_argument("--slow", action="store_true",
                         help="慢速重启专用（2秒间隔，针对约50秒看门狗超时重启的场景）")
     parser.add_argument("--all", action="store_true",
-                        help="全面修复：删除sair+test.sh+禁止看门狗")
+                        help="全面修复：删除sair+禁止看门狗")
     args = parser.parse_args()
 
     print("=" * 58)
@@ -152,7 +150,7 @@ def main():
 
     mode = "all" if args.all else "sair"
     if mode == "all":
-        print("修复目标: sair wrapper + test.sh + 看门狗")
+        print("修复目标: sair wrapper + 看门狗")
     else:
         print("修复目标: /var/upgrade/sair (删除后回退到原版sair)")
     print()

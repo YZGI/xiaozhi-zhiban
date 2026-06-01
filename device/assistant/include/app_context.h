@@ -81,6 +81,7 @@ typedef struct app_context_t {
     volatile int pending_api_abort;
     volatile int pending_api_activate;
     volatile int pending_api_config;
+    volatile int pending_api_transport_change;
     char pending_config_buf[256];
 
     uint64_t listen_timeout_ms;
@@ -91,7 +92,8 @@ typedef struct app_context_t {
     uint64_t last_tts_audio_ms;
     int listening_mode;
     int precache_enabled;
-    int protocol_version;
+    int transport_mode;
+    char custom_ws_url[512];
 } app_context_t;
 
 #endif

@@ -8,24 +8,22 @@
 #include <stdbool.h>
 #include <pthread.h>
 
-#define RECORDER_RIGHT_CHANNEL_BUF_SIZE 960
+#define RECORDER_FRAME_SIZE 960
 #define RECORDER_OPUS_BUF_SIZE 1500
+#define RECORDER_SAMPLE_RATE 16000
+#define RECORDER_CHANNELS 1
+#define RECORDER_BITRATE 16000
+#define RECORDER_FRAME_DURATION 60
 
 typedef struct {
     protocol_handler_t *proto;
     audio_dispatcher_t *disp;
-    int disp_callback_id;
 
-    int16_t right_channel_buf[RECORDER_RIGHT_CHANNEL_BUF_SIZE];
-    int right_channel_count;
+    int16_t mic_sample_buf[RECORDER_FRAME_SIZE];
+    int frame_count;
 
     void *opus_encoder;
     uint8_t opus_output_buf[RECORDER_OPUS_BUF_SIZE];
-
-    int sample_rate;
-    int channels;
-    int frame_duration;
-    int bitrate;
 
     volatile bool sending;
     audio_precache_t precache;

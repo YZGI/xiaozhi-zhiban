@@ -2,6 +2,8 @@
 #define PROTOCOL_HANDLER_H
 
 #include "websocket.h"
+#include "mqtt_client.h"
+#include "udp_audio.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
@@ -11,6 +13,9 @@
 #define PROTO_SEND_QUEUE_SIZE 32
 #define PROTO_MAX_TIMESTAMPS 8
 
+#define TRANSPORT_MODE_WEBSOCKET 0
+#define TRANSPORT_MODE_MQTT_UDP  1
+
 typedef struct {
     uint16_t version;
     uint16_t type;
@@ -18,12 +23,6 @@ typedef struct {
     uint32_t timestamp;
     uint32_t payload_size;
 } __attribute__((packed)) binary_header_v2_t;
-
-typedef struct {
-    uint8_t type;
-    uint8_t reserved;
-    uint16_t payload_size;
-} __attribute__((packed)) binary_header_v3_t;
 
 typedef struct {
     uint32_t timestamps[PROTO_MAX_TIMESTAMPS];
@@ -55,19 +54,33 @@ typedef struct {
     int channels;
     int frame_duration;
     uint64_t ping_interval_ms;
+
+    int transport_mode;
+    char mqtt_host[128];
+    int mqtt_port;
+    char mqtt_client_id[256];
+    char mqtt_username[512];
+    char mqtt_password[512];
+    int mqtt_keepalive;
+    char mqtt_subscribe_topic[256];
+    char mqtt_publish_topic[256];
 } protocol_config_t;
 
 typedef struct {
     websocket_t ws;
+    mqtt_client_t mqtt;
+    udp_audio_t udp;
     protocol_config_t config;
 
     char session_id[PROTO_MAX_SESSION_ID];
     int server_sample_rate;
     int server_frame_duration;
     int protocol_version;
+    int transport_mode;
 
     bool connected;
     bool hello_received;
+    bool mcp_initialized;
     pthread_mutex_t mutex;
     pthread_cond_t hello_cond;
 
@@ -78,7 +91,7 @@ typedef struct {
     proto_error_cb_t on_error;
     void *user_data;
 
-    uint8_t send_queue[PROTO_SEND_QUEUE_SIZE][PROTO_MAX_AUDIO_PAYLOAD + sizeof(binary_header_v2_t)];
+    uint8_t send_queue[PROTO_SEND_QUEUE_SIZE][PROTO_MAX_AUDIO_PAYLOAD];
     size_t send_queue_len[PROTO_SEND_QUEUE_SIZE];
     int send_queue_head;
     int send_queue_tail;
@@ -121,5 +134,8 @@ void timestamp_queue_destroy(timestamp_queue_t *q);
 void timestamp_queue_push(timestamp_queue_t *q, uint32_t ts);
 uint32_t timestamp_queue_pop(timestamp_queue_t *q);
 void timestamp_queue_clear(timestamp_queue_t *q);
+
+const char *proto_find_json_str(const char *json, size_t json_len, const char *key, char *out, int out_size);
+int proto_find_json_int(const char *json, size_t json_len, const char *key);
 
 #endif

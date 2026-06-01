@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 BUILD_DIR="$PROJECT_DIR/build"
 
-SDK_PATH="${SDK_PATH:-$PROJECT_DIR/../../../工具链/uClibc-Cross-Compilers-master/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot}"
+SDK_PATH="${SDK_PATH:-$PROJECT_DIR/../../toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot}"
 CC=${CC:-arm-buildroot-linux-uclibcgnueabi-gcc}
 
 export PATH="$SDK_PATH/bin:$PATH"
@@ -21,6 +21,26 @@ COMMON_CFLAGS="-Wall -Os -g0 -mcpu=cortex-a5 -mfloat-abi=soft -no-pie --sysroot=
 
 STUB_DIR="$BUILD_DIR/stubs"
 mkdir -p "$BUILD_DIR" "$STUB_DIR"
+
+VERSION_FILE="$PROJECT_DIR/.version"
+if [ -f "$VERSION_FILE" ]; then
+    IFS='.' read -r V_MAJOR V_MINOR V_PATCH < "$VERSION_FILE"
+else
+    V_MAJOR=2; V_MINOR=1; V_PATCH=0
+fi
+V_PATCH=$((V_PATCH + 1))
+if [ $V_PATCH -ge 10 ]; then
+    V_PATCH=0
+    V_MINOR=$((V_MINOR + 1))
+    if [ $V_MINOR -ge 10 ]; then
+        V_MINOR=0
+        V_MAJOR=$((V_MAJOR + 1))
+    fi
+fi
+echo "${V_MAJOR}.${V_MINOR}.${V_PATCH}" > "$VERSION_FILE"
+BUILD_VERSION="${V_MAJOR}.${V_MINOR}.${V_PATCH}"
+echo "#define XIAOZHI_VERSION \"$BUILD_VERSION\"" > "$BUILD_DIR/version.h"
+COMMON_CFLAGS="$COMMON_CFLAGS -I$BUILD_DIR"
 
 DEVICE_LIBS="applib apconfig configpart audio_service_api audio_recorder dds"
 for lib in $DEVICE_LIBS; do
@@ -65,28 +85,34 @@ $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/tls_transport.c" -o "$BUILD_DIR/tls_tran
 echo "[10/18] Compiling http_client.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/http_client.c" -o "$BUILD_DIR/http_client.o"
 
-echo "[11/18] Compiling websocket.o"
+echo "[11/20] Compiling websocket.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/websocket.c" -o "$BUILD_DIR/websocket.o"
 
-echo "[12/18] Compiling protocol_handler.o"
+echo "[12/20] Compiling mqtt_client.o"
+$CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/mqtt_client.c" -o "$BUILD_DIR/mqtt_client.o"
+
+echo "[13/20] Compiling udp_audio.o"
+$CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/udp_audio.c" -o "$BUILD_DIR/udp_audio.o"
+
+echo "[14/20] Compiling protocol_handler.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/protocol_handler.c" -o "$BUILD_DIR/protocol_handler.o"
 
-echo "[13/18] Compiling audio_player.o"
+echo "[15/20] Compiling audio_player.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/audio_player.c" -o "$BUILD_DIR/audio_player.o"
 
-echo "[14/18] Compiling audio_recorder.o"
+echo "[16/20] Compiling audio_recorder.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/audio_recorder.c" -o "$BUILD_DIR/audio_recorder.o"
 
-echo "[14b/18] Compiling audio_precache.o"
+echo "[16b/20] Compiling audio_precache.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/audio_precache.c" -o "$BUILD_DIR/audio_precache.o"
 
-echo "[15/18] Compiling mcp_handler.o"
+echo "[17/20] Compiling mcp_handler.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/mcp_handler.c" -o "$BUILD_DIR/mcp_handler.o"
 
-echo "[16/18] Compiling api_server.o"
+echo "[18/20] Compiling api_server.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/api_server.c" -o "$BUILD_DIR/api_server.o"
 
-echo "[17/18] Compiling diag_module.o"
+echo "[19/20] Compiling diag_module.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/diag_module.c" -o "$BUILD_DIR/diag_module.o"
 
 echo "Linking sair"
@@ -107,6 +133,8 @@ $CC --sysroot=$SYSROOT \
     $BUILD_DIR/tls_transport.o \
     $BUILD_DIR/http_client.o \
     $BUILD_DIR/websocket.o \
+    $BUILD_DIR/mqtt_client.o \
+    $BUILD_DIR/udp_audio.o \
     $BUILD_DIR/protocol_handler.o \
     $BUILD_DIR/audio_player.o \
     $BUILD_DIR/audio_recorder.o \
@@ -139,3 +167,9 @@ echo ""
 echo "=== Build successful! ==="
 echo "Output: $BUILD_DIR/sair"
 ls -la "$BUILD_DIR/sair"
+
+PREBUILT_DIR="$PROJECT_DIR/prebuilt"
+mkdir -p "$PREBUILT_DIR"
+cp "$BUILD_DIR/sair" "$PREBUILT_DIR/sair"
+cp "$BUILD_DIR/version.h" "$PREBUILT_DIR/version.h"
+echo "Copied to: $PREBUILT_DIR/sair"

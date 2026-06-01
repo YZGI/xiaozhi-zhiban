@@ -6,7 +6,6 @@ __pycache__/
 *.tar.bz2
 *.tar.xz
 toolchain/
-prebuilt/
 .DS_Store
 Thumbs.db
 .env
@@ -16,3 +15,4 @@ Thumbs.db
 .idea/
 .vscode/
 project_config.json
+version.h

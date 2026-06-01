@@ -18,11 +18,12 @@
 
 - 🎙️ **语音唤醒与对话** — 唤醒词检测、ASR 语音识别、WebSocket 实时对话，可连接豆包、DeepSeek 等 LLM 模型进行智能对话与意图识别
 - 🌐 **Web 控制面板** — 通过浏览器管理设备，支持 WiFi 和 USB 两种连接方式
-- 🔄 **热更新** — SIGUSR2 + execvp 机制，无需重启设备即可更新助手，PID 不变
+- 🔄 **热更新** — assistant 支持 cmd.json + SIGUSR1 + execvp 热更新（PID 不变，秒级完成），xwebd 支持冷更新（替换二进制+重启设备）
 - 🛡️ **安全回退** — 内置开机看门狗，连续启动失败自动回退到原版固件
+- 🚨 **紧急修复** — 设备频繁重启时，高频轮询检测上线立即恢复出厂
 - 📊 **实时监控** — 设备状态、日志、配置一览无余
 - ⚙️ **运行时配置** — WebSocket 地址、超时参数、日志级别等均可在线调整
-- 🔌 **文件 IPC** — assistant 与 xwebd 通过文件系统通信，避免 TCP 开销
+- 🔌 **双协议栈** — 支持 WebSocket 和 MQTT+UDP 双协议栈，MQTT 用于控制信令，UDP 用于 AES-128-CTR 加密音频传输；当前仅 WebSocket 模式可用（MQTT+UDP 因官方网关兼容性暂不可用）；assistant 与 xwebd 通过文件 IPC 通信
 - 🔗 **MCP 接入点** — 支持配置 xiaozhi.me 智能体专属 MCP 端点，实现工具调用能力扩展
 - 🧪 **自检诊断** — 分层自检架构，部署前验证环境兼容性
 
@@ -52,6 +53,15 @@
 │  浏览器界面  │     JSON     │  HTTP API   │  sair_cmd.json │  语音助手    │
 └─────────────┘              └─────────────┘  sair_status.json└──────────────┘
                                               sair_config.json
+                                              ┌──────────────┐
+                                              │   云端服务    │
+                                              │ xiaozhi.me   │
+                                              └──────┬───────┘
+                                                     │
+                                              ┌──────┴───────┐
+                                              │  WebSocket   │  ← 协议栈1: WS+Opus
+                                              │  MQTT+UDP    │  ← 协议栈2: MQTT信令+AES-128-CTR加密音频
+                                              └──────────────┘
 ```
 
 ### assistant 内部架构
@@ -63,19 +73,19 @@
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
 │  │ 状态机    │  │ 唤醒模块  │  │ 音频调度  │  │ 协议处理器    │   │
 │  │ 6状态     │  │ ASR引擎   │  │ 3通道录音 │  │ WebSocket    │   │
-│  │ 线程安全  │  │ 唤醒词检测│  │ TTS播放   │  │ Opus编解码   │   │
+│  │ 线程安全  │  │ 唤醒词检测│  │ TTS播放   │  │ MQTT+UDP     │   │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────────┘   │
 │                                                                 │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐   │
 │  │ 配置管理  │  │ API服务   │  │ 诊断模块  │  │ 看门狗       │   │
-│  │ OTA激活   │  │ 文件IPC   │  │ 4项检查   │  │ 软看门狗续命 │   │
+│  │ OTA激活   │  │ 文件IPC   │  │ 4项检查   │  │ 喂狗续命     │   │
 │  │ WiFi检查  │  │ set_config│  │ 运行时自检│  │ 崩溃保护     │   │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────────┘   │
 │                                                                 │
-│  ┌──────────┐  ┌──────────┐                                    │
-│  │ 触摸按键  │  │ MCP处理器 │                                    │
-│  │ HOME/BACK │  │ 工具调用  │                                    │
-│  └──────────┘  └──────────┘                                    │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                     │
+│  │ 触摸按键  │  │ MCP处理器 │  │ 音频预缓存│                     │
+│  │ HOME/BACK │  │ 工具调用  │  │ TTS预加载 │                     │
+│  └──────────┘  └──────────┘  └──────────┘                     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -224,7 +234,7 @@ wsl -e bash -c "cd /mnt/d/your-path/xiaozhi-zhiban-develop/device/xwebd && bash 
 
 编译产物：`device/xwebd/build/xwebd`
 
-> 💡 build.sh 默认从 `$PROJECT_DIR/../../toolchain/` 查找工具链，也可通过 `SDK_PATH` 环境变量指定：
+> 💡 build.sh 默认从 `$PROJECT_DIR/../../toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot` 查找工具链，也可通过 `SDK_PATH` 环境变量指定：
 > ```bash
 > SDK_PATH=/path/to/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot bash build.sh
 > ```
@@ -270,39 +280,56 @@ Panel 支持两种连接方式：
 
 > 💡 完成以上配置后，说唤醒词即可开始与 AI 对话。MCP 接入点决定了智能体使用的 LLM 模型（如豆包、DeepSeek 等）和工具调用能力，可在小智控制台中随时切换。
 
-### 热更新（无需重启设备）
+### 更新方式
+
+| 模块 | 热更新 | 冷更新 |
+|------|--------|--------|
+| assistant | ✅ cmd.json + SIGUSR1 + execvp（PID 不变，秒级完成） | ✅ 替换二进制 + reboot |
+| xwebd | ❌ 不支持 | ✅ 替换二进制 + reboot（看门狗+worker 架构自动恢复） |
+
+#### assistant 热更新
+
+推荐通过 Panel 面板操作（无线模式 → 语音助手管理 → 热更新），也可手动通过 xwebd API 触发：
 
 ```bash
-# 一键编译+上传+热更新
-python scripts/transfer/hot_update.py
-
-# 跳过编译，仅上传+热更新
-python scripts/transfer/hot_update.py --no-build
+# 通过 xwebd API 触发热更新（需先上传新二进制到 /var/upgrade/sair_new）
+curl -X POST http://DEVICE_IP:8080/api/assistant/upgrade
 ```
 
-### 冷更新（需重启设备）
+#### 冷更新
+
+推荐通过 Panel 面板操作（有线/无线模式均可），也可手动执行：
 
 ```bash
-python scripts/transfer/upload_nc_win.py device/assistant/build/sair /var/upgrade/sair
+# 手动重启设备
 python scripts/debug/force_reboot.py
 ```
 
-### 热更新原理
+#### assistant 热更新原理
 
 ```
-SIGUSR2 → 信号处理器中:
-  1. stat("/var/upgrade/sair_new") 确认新文件存在
-  2. rename sair→sair_old, sair_new→sair
-  3. execvp("/var/upgrade/sair") 替换进程（PID不变）
-→ 新进程启动:
+xwebd 收到 /api/assistant/upgrade:
+  1. rename sair→sair_old, sair_new→sair
+  2. 写入 /tmp/sair_cmd.json: {"cmd":"upgrade"}
+  3. kill(sair_pid, SIGUSR1) 通知 assistant 主循环
+assistant 主循环检测到 g_hot_update_pending:
+  1. 优雅停止资源（唤醒、录音、播放器、协议连接）
+  2. 删除 IPC 文件（sair_status.json 等）
+  3. 关闭所有文件描述符
+  4. execvp("/var/upgrade/sair") 替换进程（PID不变）
+新进程启动:
   1. 检测热更新标记（app_running_list 中 pid==getpid() 的 sair 条目）
   2. 清理 IPC 资源（sync_shm, /tmp/service/sair）
   3. applib_init → 正常启动
 ```
 
+**为什么用 cmd.json + SIGUSR1 而非 SIGUSR2**：applib 框架内部拦截了 SIGUSR2 信号，导致 SIGUSR2 处理器永远不会被调用。SIGUSR1 是 applib 自身也在使用的信号，不会被屏蔽，因此热更新复用 cmd.json + SIGUSR1 通路（与唤醒/中止/激活走同一路径）。
+
 **为什么不用 kill + restart**：kill 后 PID 变化 → Manager 检测 WIFSIGNALED → reboot；SCHED_RR 调度丢失；kill 到新进程启动有间隙 → 看门狗超时。
 
-> ⚠️ **版本号必须更新**：热更新后 PID 不变（execvp 特性），Panel 通过版本号变化判断更新是否成功。每次发布新版本前，**务必修改** `device/assistant/include/xiaozhi_config.h` 中的 `XIAOZHI_VERSION` 宏，否则 Panel 无法检测到热更新成功。
+> ⚠️ **版本号自动递增**：build.sh 编译时自动生成 `version.h`，通过 `.version` 文件管理版本号，采用进位逻辑（每位到10进位，如 2.1.9 → 2.2.0）。当前 assistant 版本 2.1.x，xwebd 版本 1.1.x。
+>
+> `.version` 文件需提交到仓库，确保不同环境编译时版本号一致。
 
 ---
 
@@ -312,52 +339,18 @@ SIGUSR2 → 信号处理器中:
 xiaozhi-zhiban-develop/
 ├── device/
 │   ├── assistant/                    # 语音助手模块
-│   │   ├── src/                      # C 源码
-│   │   │   ├── main.c               # 主程序（状态机、事件循环、IPC）
-│   │   │   ├── state_machine.c      # 状态机实现
-│   │   │   ├── wakeup_module.c      # 唤醒词检测模块
-│   │   │   ├── audio_dispatcher.c   # 音频分发（3通道→ASR引擎）
-│   │   │   ├── audio_player.c       # TTS 播放（audio_track API）
-│   │   │   ├── audio_recorder.c     # 音频录制（audio_recorder API）
-│   │   │   ├── protocol_handler.c   # WebSocket 协议处理
-│   │   │   ├── websocket.c          # WebSocket 客户端
-│   │   │   ├── tls_transport.c      # TLS 传输层（mbedtls）
-│   │   │   ├── http_client.c        # HTTP 客户端（OTA 激活）
-│   │   │   ├── config_manager.c     # 配置管理
-│   │   │   ├── api_server.c         # 文件 IPC API 服务
-│   │   │   ├── diag_module.c        # 诊断自检模块
-│   │   │   ├── mcp_handler.c        # MCP 工具调用处理器
-│   │   │   ├── touch_key.c          # 触摸按键驱动
-│   │   │   ├── watchdog.c           # 看门狗管理
-│   │   │   └── plog.c               # 持久化日志
+│   │   ├── src/                      # C 源码（20个.c文件）
 │   │   ├── include/                  # 头文件
-│   │   │   ├── app_context.h        # 应用上下文（全局状态）
-│   │   │   ├── xiaozhi_config.h     # 配置常量（超时、消息ID等）
-│   │   │   ├── state_machine.h      # 状态机接口
-│   │   │   ├── wakeup_module.h      # 唤醒模块接口
-│   │   │   ├── websocket.h          # WebSocket 接口
-│   │   │   ├── protocol_handler.h   # 协议处理器接口
-│   │   │   ├── audio_player.h       # 音频播放接口
-│   │   │   ├── audio_recorder.h     # 音频录制接口
-│   │   │   ├── audio_dispatcher.h   # 音频分发接口
-│   │   │   ├── config_manager.h     # 配置管理接口
-│   │   │   ├── api_server.h         # API 服务接口
-│   │   │   ├── diag_module.h        # 诊断模块接口
-│   │   │   ├── mcp_handler.h        # MCP 处理器接口
-│   │   │   ├── touch_key.h          # 触摸按键接口
-│   │   │   ├── watchdog.h           # 看门狗接口
-│   │   │   ├── tls_transport.h      # TLS 传输接口
-│   │   │   ├── http_client.h        # HTTP 客户端接口
-│   │   │   ├── plog.h               # 日志接口
-│   │   │   └── reverse/             # 逆向还原的设备原生 API 头文件
-│   │   │       ├── applib_api.h     # applib 框架 API
-│   │   │       ├── audio_recorder_api.h  # 音频录制 API
-│   │   │       ├── audio_service_api.h   # 音频服务 API
-│   │   │       └── sair_asr_api.h        # ASR 引擎 API
+│   │   │   ├── reverse/             # 逆向还原的设备原生 API 头文件
+│   │   │   │   ├── applib_api.h
+│   │   │   │   ├── audio_recorder_api.h
+│   │   │   │   ├── audio_service_api.h
+│   │   │   │   └── sair_asr_api.h
+│   │   │   └── (其他20个.h文件)
 │   │   ├── lib/                      # 第三方库头文件
-│   │   │   ├── cJSON/               # cJSON 库
-│   │   │   ├── mbedtls/             # mbedTLS 库
-│   │   │   └── opus/                # Opus 编解码库
+│   │   │   ├── cJSON/
+│   │   │   ├── mbedtls/
+│   │   │   └── opus/
 │   │   ├── lib_sf/                   # soft-float 预编译静态库
 │   │   │   ├── libcjson.a
 │   │   │   ├── libmbedtls.a
@@ -365,45 +358,44 @@ xiaozhi-zhiban-develop/
 │   │   │   ├── libmbedcrypto.a
 │   │   │   └── libopus.a
 │   │   ├── prebuilt/                 # 预编译二进制（供 main 分支同步）
-│   │   └── build.sh                  # 编译脚本
+│   │   │   ├── sair
+│   │   │   └── version.h
+│   │   └── build.sh                  # 编译脚本（自动生成 version.h）
 │   └── xwebd/                        # Web 控制守护进程
 │       ├── src/
-│       │   └── xwebd.c              # xwebd 完整实现（单文件，~2000行）
+│       │   ├── xwebd.c
+│       │   └── usb_helper.c
 │       ├── include/
-│       │   └── xwebd_config.h       # 配置常量
+│       │   └── xwebd_config.h
 │       ├── scripts/
-│       │   └── boot_watchdog.sh     # 开机看门狗脚本
+│       │   ├── boot_watchdog.sh
+│       │   └── watchdog_guard.sh
 │       ├── prebuilt/
-│       └── build.sh
+│       │   ├── xwebd
+│       │   └── version.h
+│       ├── build.sh
+│       └── build_helper.sh
 ├── panel/                            # PC 端控制面板
-│   ├── control_panel.py             # 启动入口
-│   ├── server.py                    # HTTP 后端服务
-│   ├── device_api.py                # xwebd API 客户端
-│   ├── adb_manager.py               # ADB 设备管理
-│   ├── config.py                    # 配置（环境变量读取）
-│   ├── log_config.py                # 日志配置
+│   ├── control_panel.py
+│   ├── server.py
+│   ├── device_api.py
+│   ├── adb_manager.py
+│   ├── config.py
+│   ├── log_config.py
 │   └── static/
-│       ├── index.html               # 前端页面
-│       ├── app.js                   # 前端逻辑
-│       └── style.css                # 前端样式
+│       ├── index.html
+│       ├── app.js
+│       └── style.css
 ├── scripts/                          # 开发调试脚本
 │   ├── config_loader.py             # 项目参数加载模块
-│   ├── transfer/                    # 文件传输工具
-│   │   ├── hot_update.py            # 热更新（编译+上传+SIGUSR2）
-│   │   ├── upload_nc_win.py         # NC方式上传文件
-│   │   └── download_nc_win.py       # NC方式下载文件
 │   ├── debug/                       # 调试工具
 │   │   ├── force_reboot.py          # 强制重启设备
-│   │   └── high_freq_monitor.py     # 高频监控设备状态
+│   │   ├── high_freq_monitor.py     # 高频监控设备状态
+│   │   └── monitor_keys.sh          # 按键监测（设备端运行）
 │   └── device_check/                # 设备检查工具
 │       ├── emergency_fix.py         # 紧急修复循环重启
-│       ├── diagnose_device.py       # 设备全面诊断
-│       ├── diagnose_network.py      # 网络全面诊断
-│       ├── restart_sair.py          # 重启sair服务
-│       └── check_status_quick.py    # 快速状态检查
+│       └── emergency_nuke.py        # 紧急恢复出厂
 ├── project_config.example.json       # 项目参数配置模板
-├── project_config.json               # 实际配置（需从模板复制，已加入.gitignore）
-├── toolchain/                        # 交叉编译工具链（需自行下载）
 ├── LICENSE
 └── README.md
 ```
@@ -420,7 +412,7 @@ assistant 与 xwebd 通过 `/tmp/` 下的 JSON 文件通信，避免 TCP 开销�
 |------|------|------|
 | `/tmp/sair_status.json` | assistant → xwebd | 状态输出（state, version, activation_code） |
 | `/tmp/sair_config.json` | assistant → xwebd | 配置输出（ws_url, ws_token, log_level, 超时参数, mcp_endpoint） |
-| `/tmp/sair_cmd.json` | xwebd → assistant | 命令输入（set_config, wakeup, abort, activate） |
+| `/tmp/sair_cmd.json` | xwebd → assistant | 命令输入（set_config, wakeup, abort, activate, upgrade） |
 | `/tmp/sair_diag_request` | xwebd → assistant | 自检触发（空文件，创建即触发） |
 | `/tmp/sair_diag.json` | assistant → xwebd | 自检结果 |
 
@@ -472,12 +464,6 @@ cp project_config.example.json project_config.json
 |--------|--------|------|
 | device_ip | 192.168.1.1 | 设备局域网IP地址 |
 | device_telnet_port | 23 | 设备Telnet端口 |
-| project_dir | device/assistant | sair项目相对路径 |
-| build_dir | build | 编译输出目录 |
-| remote_sair_path | /var/upgrade/sair | 设备上sair路径 |
-| remote_sair_new_path | /var/upgrade/sair_new | 设备上sair_new路径 |
-| nc_upload_port | 19090 | NC上传端口 |
-| http_upload_port | 18080 | HTTP上传端口 |
 
 > `project_config.json` 已加入 `.gitignore`，不会被提交到仓库。如果文件不存在，脚本会自动使用 `project_config.example.json` 中的示例值并给出提示。
 
@@ -495,6 +481,8 @@ cp project_config.example.json project_config.json
 | wakeup_cooldown | 3000 | 500-10000 ms | 唤醒冷却时间 |
 | ws_ping_interval | 25000 | 5000-120000 ms | WebSocket 心跳间隔 |
 | mcp_endpoint | (空) | 任意 URL | MCP 接入点地址（从 xiaozhi.me 控制台获取的智能体专属端点） |
+| transport_mode | 0 | 0=WebSocket, 1=MQTT+UDP | 传输模式（当前仅 WebSocket 可用） |
+| custom_ws_url | (空) | 任意 URL | 自定义 WebSocket 地址 |
 
 ### 编译时配置
 
@@ -502,7 +490,7 @@ cp project_config.example.json project_config.json
 
 | 宏 | 值 | 说明 |
 |----|-----|------|
-| XIAOZHI_VERSION | "2.0.0" | 版本号 |
+| XIAOZHI_VERSION | 自动生成 | 版本号（由 build.sh 从 version.h 注入，格式 major.minor.patch，如 2.1.1） |
 | DEFAULT_OTA_URL | https://api.tenclass.net/xiaozhi/ota/ | OTA 激活地址 |
 | DEFAULT_WS_URL | wss://api.tenclass.net/xiaozhi/v1/ | WebSocket 地址 |
 | GOODIX_KEY_HOME | 102 | 触摸屏 HOME 键码 |
@@ -548,6 +536,32 @@ python scripts/device_check/emergency_fix.py --slow   # 慢速重启专用
 # 手动修复
 adb shell "rm -f /var/upgrade/sair; reboot"
 ```
+
+### 🚨 紧急修复
+
+当设备因自定义程序崩溃导致**频繁重启**时，常规手段难以操作（设备刚上线就又重启）。紧急修复功能通过**高频轮询**设备连接状态，一旦检测到设备上线，**立即执行恢复出厂设置**。
+
+**使用场景**：设备不断重启、卡死无法正常操作时。
+
+**使用方式**：
+
+1. **Panel 控制面板**（推荐）：
+   - 有线模式：点击「🚨 紧急修复」按钮
+   - 无线模式：点击「🚨 紧急修复」按钮
+   - 需二次确认，确认后自动高频轮询，检测到设备立即清理
+
+2. **命令行脚本**：
+   ```bash
+   python scripts/device_check/emergency_nuke.py --adb          # ADB模式（推荐，更快）
+   python scripts/device_check/emergency_nuke.py --http IP      # HTTP模式
+   python scripts/device_check/emergency_nuke.py --auto IP      # 自动模式（先ADB后HTTP）
+   ```
+
+**原理**：
+- ADB 模式：以 0.3 秒间隔轮询 `adb devices`，检测到设备后立即执行 `killall` + `rm` 清理所有自定义文件
+- HTTP 模式：以 0.5 秒间隔轮询 xwebd API，检测到设备后依次调用卸载接口
+
+> ⚠️ **重要**：此操作将删除设备上所有自定义程序（sair/xwebd）及相关配置，恢复到原生状态，不可撤销。
 
 ---
 
@@ -682,49 +696,77 @@ assistant 诊断模块保留 4 项独有检查：
 
 xwebd 监听设备 8080 端口，提供以下 API：
 
+### 基础接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /api/ping | 心跳检测 |
+| GET | /api/version | 获取版本号 |
+| GET | /api/config | 获取 xwebd 配置（upload_max_mb, log_level） |
+| PUT | /api/config | 修改 xwebd 配置 |
+| GET | /api/system | 系统信息（CPU、内存、内核） |
+
 ### 设备管理
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | /api/services | 获取进程列表 |
-| GET | /api/diag | 设备自检 |
+| GET | /api/services | 获取服务状态列表 |
+| POST | /api/services/toggle | 服务开关（telnet/autostart/led/usb_lun/boot_watchdog） |
+| GET | /api/processes | 获取进程列表 |
+| POST | /api/processes/control | 进程控制（stop/start/restart） |
+| GET | /api/diag | 设备自检诊断 |
 | POST | /api/reboot | 重启设备 |
-| GET | /api/wifi | WiFi 信息 |
-| GET | /api/disk | 磁盘信息 |
-| GET | /api/memory | 内存信息 |
+| POST | /api/poweroff | 关机 |
 
-### 音量/亮度
+### 日志
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | /api/volume | 获取音量 |
-| PUT | /api/volume | 设置音量 |
-| GET | /api/brightness | 获取亮度 |
-| PUT | /api/brightness | 设置亮度 |
+| GET | /api/logs | 获取 xwebd 日志 |
+| POST | /api/logs/clean?source=N | 清理日志（1=sair, 2=xwebd） |
+
+### USB 模式
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /api/usb/mode | 获取 USB 模式 |
+| POST | /api/usb/mode | 切换 USB 模式（mass_adb/adb） |
 
 ### 文件管理
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | /api/upload | 上传文件 |
-| GET | /api/files | 文件列表 |
-| DELETE | /api/files | 删除文件 |
+| POST | /api/upload | 上传文件（X-Filename 头指定文件名） |
+| GET | /api/files?path= | 文件列表 |
+| GET | /api/files/download?path= | 下载文件 |
+| DELETE | /api/files?path= | 删除文件 |
+| POST | /api/files/batch-delete | 批量删除 |
+| POST | /api/files/cleanup | 垃圾清理（日志截断、临时文件、旧备份） |
 
 ### 助手管理
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | /api/assistant/status | 助手状态 |
+| GET | /api/assistant/status | 助手状态（installed, running, version 等） |
 | GET | /api/assistant/config | 助手配置 |
 | PUT | /api/assistant/config | 修改配置 |
+| GET | /api/assistant/env | 助手环境检查 |
+| GET | /api/assistant/diag | 助手诊断 |
+| GET | /api/assistant/logs | 助手日志 |
+| POST | /api/assistant/logs/clear | 清除助手日志 |
 | POST | /api/assistant/deploy | 部署助手（冷部署，设备重启） |
 | POST | /api/assistant/update | 冷更新（设备重启） |
-| POST | /api/assistant/upgrade | 热更新（SIGUSR2，不重启） |
+| POST | /api/assistant/upgrade | 热更新（cmd.json+SIGUSR1，不重启设备，秒级完成） |
 | POST | /api/assistant/uninstall | 卸载助手 |
 | POST | /api/assistant/activate | 激活设备 |
-| GET | /api/assistant/env | 助手环境检查 |
-| GET | /api/assistant/logs | 助手日志 |
-| GET | /api/assistant/diag | 助手诊断 |
+| POST | /api/assistant/wakeup | 唤醒助手 |
+| POST | /api/assistant/abort | 中止助手对话 |
+
+### 自更新
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | /api/self-update | xwebd 冷更新（替换二进制 + reboot） |
 
 ---
 
@@ -735,8 +777,7 @@ xwebd 监听设备 8080 端口，提供以下 API：
 | `XIAOZHI_DEVICE_HOST` | (空) | 设备 IP 地址，Panel 启动时自动使用 |
 | `XIAOZHI_PANEL_PORT` | 3000 | Panel 监听端口 |
 | `XIAOZHI_XWEBD_PORT` | 8080 | xwebd 服务端口 |
-| `XIAOZHI_SAIR_API_PORT` | 8081 | assistant API 端口（旧版遗留，当前未使用） |
-| `SDK_PATH` | `../../toolchain/...` | 交叉编译工具链路径 |
+| `SDK_PATH` | `../../toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot` | 交叉编译工具链路径 |
 
 使用示例：
 ```bash

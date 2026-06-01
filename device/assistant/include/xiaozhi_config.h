@@ -1,7 +1,11 @@
 #ifndef XIAOZHI_ASSISTANT_CONFIG_H
 #define XIAOZHI_ASSISTANT_CONFIG_H
 
-#define XIAOZHI_VERSION "2.0.0"
+#include "version.h"
+
+#ifndef XIAOZHI_VERSION
+#define XIAOZHI_VERSION "dev"
+#endif
 #define XIAOZHI_CHIP_MODEL "gs705b"
 
 #define ACTIVATION_CHECK_INTERVAL_MS  5000

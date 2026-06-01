@@ -419,24 +419,9 @@ int wakeup_start(wakeup_module_t *mod)
     if (mod->started)
         return 0;
 
-    /* 等待ASR引擎初始化完成通知 */
     if (!mod->asr_init_done)
     {
-        PLOG_I("WAKEUP", "等待ASR初始化完成...");
-        int wait_count = 0;
-        while (!mod->asr_init_done && wait_count < 50)
-        {
-            usleep(100000);
-            wait_count++;
-        }
-        if (!mod->asr_init_done)
-        {
-            PLOG_W("WAKEUP", "ASR init_done超时(5秒), 仍然尝试启动 (DUI认证可能未完成但唤醒词仍可用)");
-        }
-        else
-        {
-            PLOG_I("WAKEUP", "ASR初始化完成, 等待耗时%dms", wait_count * 100);
-        }
+        PLOG_I("WAKEUP", "ASR未认证初始化完成, 直接启动 (DUI认证不影响唤醒词功能)");
     }
 
     /* 启动ASR引擎 */

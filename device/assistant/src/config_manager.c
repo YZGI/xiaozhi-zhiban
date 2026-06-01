@@ -148,11 +148,26 @@ int config_manager_check_wifi(void)
  */
 static int save_ws_config_cache(const char *url, const char *token, const char *activation_code)
 {
-    FILE *fp = fopen("/var/upgrade/.ws_config", "w");
+    const char *path = "/var/upgrade/.ws_config";
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE *fp = fopen(tmp_path, "w");
     if (!fp)
         return -1;
-    fprintf(fp, "%s\n%s\n%s\n", url, token, activation_code ? activation_code : "");
+    if (fprintf(fp, "%s\n%s\n%s\n", url, token, activation_code ? activation_code : "") < 0)
+    {
+        fclose(fp);
+        unlink(tmp_path);
+        PLOG_E("CFG", "写入ws配置缓存失败");
+        return -1;
+    }
     fclose(fp);
+    if (rename(tmp_path, path) != 0)
+    {
+        unlink(tmp_path);
+        PLOG_E("CFG", "重命名ws配置缓存失败: %s", strerror(errno));
+        return -1;
+    }
     PLOG_I("CFG", "已保存ws配置缓存");
     return 0;
 }
@@ -265,8 +280,63 @@ int config_manager_check_activation(config_manager_t *cfg)
     const char *ws_start = memmem(response.body, response.body_len, "\"websocket\"", 11);
     if (ws_start)
     {
-        find_json_str(ws_start, response.body_len - (ws_start - response.body), "url", ws_url, sizeof(ws_url));
-        find_json_str(ws_start, response.body_len - (ws_start - response.body), "token", ws_token, sizeof(ws_token));
+        size_t ws_len = response.body_len - (ws_start - response.body);
+        find_json_str(ws_start, ws_len, "url", ws_url, sizeof(ws_url));
+        find_json_str(ws_start, ws_len, "token", ws_token, sizeof(ws_token));
+        char ver_str[16] = {0};
+        find_json_str(ws_start, ws_len, "version", ver_str, sizeof(ver_str));
+        if (ver_str[0])
+        {
+            int ver = atoi(ver_str);
+            if (ver >= 1 && ver <= 3)
+                cfg->ws_protocol_version = ver;
+        }
+    }
+
+    const char *mqtt_start = memmem(response.body, response.body_len, "\"mqtt\"", 6);
+    if (mqtt_start)
+    {
+        char mqtt_host[128] = {0};
+        char mqtt_port_str[16] = {0};
+        char mqtt_client_id[256] = {0};
+        char mqtt_username[512] = {0};
+        char mqtt_password[512] = {0};
+        char mqtt_keepalive_str[16] = {0};
+        char mqtt_sub_topic[256] = {0};
+        char mqtt_pub_topic[256] = {0};
+
+        size_t mqtt_len = response.body_len - (mqtt_start - response.body);
+        find_json_str(mqtt_start, mqtt_len, "endpoint", mqtt_host, sizeof(mqtt_host));
+        find_json_str(mqtt_start, mqtt_len, "port", mqtt_port_str, sizeof(mqtt_port_str));
+        find_json_str(mqtt_start, mqtt_len, "client_id", mqtt_client_id, sizeof(mqtt_client_id));
+        find_json_str(mqtt_start, mqtt_len, "username", mqtt_username, sizeof(mqtt_username));
+        find_json_str(mqtt_start, mqtt_len, "password", mqtt_password, sizeof(mqtt_password));
+        find_json_str(mqtt_start, mqtt_len, "keepalive", mqtt_keepalive_str, sizeof(mqtt_keepalive_str));
+        find_json_str(mqtt_start, mqtt_len, "subscribe_topic", mqtt_sub_topic, sizeof(mqtt_sub_topic));
+        find_json_str(mqtt_start, mqtt_len, "publish_topic", mqtt_pub_topic, sizeof(mqtt_pub_topic));
+
+        if (mqtt_host[0] && mqtt_client_id[0])
+        {
+            strncpy(cfg->mqtt_host, mqtt_host, sizeof(cfg->mqtt_host) - 1);
+            cfg->mqtt_port = atoi(mqtt_port_str);
+            if (cfg->mqtt_port <= 0)
+                cfg->mqtt_port = 8883;
+            strncpy(cfg->mqtt_client_id, mqtt_client_id, sizeof(cfg->mqtt_client_id) - 1);
+            strncpy(cfg->mqtt_username, mqtt_username, sizeof(cfg->mqtt_username) - 1);
+            strncpy(cfg->mqtt_password, mqtt_password, sizeof(cfg->mqtt_password) - 1);
+            cfg->mqtt_keepalive = atoi(mqtt_keepalive_str);
+            if (cfg->mqtt_keepalive <= 0)
+                cfg->mqtt_keepalive = 240;
+            if (mqtt_sub_topic[0] && strcmp(mqtt_sub_topic, "null") != 0)
+                strncpy(cfg->mqtt_subscribe_topic, mqtt_sub_topic, sizeof(cfg->mqtt_subscribe_topic) - 1);
+            else
+                cfg->mqtt_subscribe_topic[0] = '\0';
+            strncpy(cfg->mqtt_publish_topic, mqtt_pub_topic, sizeof(cfg->mqtt_publish_topic) - 1);
+            cfg->has_mqtt_config = 1;
+            PLOG_I("CFG", "OTA: MQTT配置已获取, host=%s port=%d sub_topic=%s",
+                   mqtt_host, cfg->mqtt_port,
+                   cfg->mqtt_subscribe_topic[0] ? cfg->mqtt_subscribe_topic : "(none)");
+        }
     }
 
     const char *act_start = memmem(response.body, response.body_len, "\"activation\"", 12);

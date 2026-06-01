@@ -27,6 +27,38 @@
 
 #define TAG "IPC"
 
+static int json_escape_len(const char *s, int max_out)
+{
+    int len = 0;
+    while (*s)
+    {
+        if (*s == '"' || *s == '\\') len += 2;
+        else if (*s == '\n') len += 2;
+        else if (*s == '\r') len += 2;
+        else if (*s == '\t') len += 2;
+        else len++;
+        s++;
+        if (max_out > 0 && len >= max_out - 1) break;
+    }
+    return len;
+}
+
+static int json_escape(const char *s, char *out, int out_size)
+{
+    int i = 0;
+    while (*s && i < out_size - 2)
+    {
+        if (*s == '"' || *s == '\\') { out[i++] = '\\'; out[i++] = *s; }
+        else if (*s == '\n') { out[i++] = '\\'; out[i++] = 'n'; }
+        else if (*s == '\r') { out[i++] = '\\'; out[i++] = 'r'; }
+        else if (*s == '\t') { out[i++] = '\\'; out[i++] = 't'; }
+        else { out[i++] = *s; }
+        s++;
+    }
+    out[i] = '\0';
+    return i;
+}
+
 extern app_context_t g_app;
 
 static const char *state_to_string(xiaozhi_state_t state)
@@ -79,12 +111,14 @@ static int write_file_atomic(const char *path, const char *data, int len)
 void api_server_write_status(void)
 {
     xiaozhi_state_t state = state_machine_get_state(&g_app.sm);
+    char esc_code[256];
+    json_escape(g_app.config.activation_code, esc_code, sizeof(esc_code));
     char buf[512];
     int len = snprintf(buf, sizeof(buf),
         "{\"state\":\"%s\",\"version\":\"%s\",\"activation_code\":\"%s\",\"activated\":%s}\n",
         state_to_string(state),
         XIAOZHI_VERSION,
-        g_app.config.activation_code,
+        esc_code,
         g_app.config.has_ws_config ? "true" : "false");
     write_file_atomic("/tmp/sair_status.json", buf, len);
 }
@@ -92,14 +126,18 @@ void api_server_write_status(void)
 void api_server_write_config(void)
 {
     int plog_lvl = plog_get_level();
-    char buf[1536];
+    char esc_ws_url[1024], esc_ws_token[512], esc_mcp[1024];
+    json_escape(g_app.config.ws_url, esc_ws_url, sizeof(esc_ws_url));
+    json_escape(g_app.config.ws_token, esc_ws_token, sizeof(esc_ws_token));
+    json_escape(g_app.config.mcp_endpoint, esc_mcp, sizeof(esc_mcp));
+    char buf[4096];
     int len = snprintf(buf, sizeof(buf),
         "{\"ws_url\":\"%s\",\"ws_token\":\"%s\",\"log_level\":\"%s\","
         "\"listen_timeout\":%llu,\"session_timeout\":%llu,"
         "\"wakeup_cooldown\":%llu,\"ws_ping_interval\":%llu,"
         "\"mcp_endpoint\":\"%s\",\"listening_mode\":\"%s\"}\n",
-        g_app.config.ws_url,
-        g_app.config.ws_token,
+        esc_ws_url,
+        esc_ws_token,
         plog_lvl == PLOG_LEVEL_DEBUG ? "DEBUG" :
         plog_lvl == PLOG_LEVEL_INFO  ? "INFO" :
         plog_lvl == PLOG_LEVEL_WARN  ? "WARN" : "ERROR",
@@ -107,7 +145,7 @@ void api_server_write_config(void)
         (unsigned long long)g_app.session_timeout_ms,
         (unsigned long long)g_app.wakeup_cooldown_ms,
         (unsigned long long)g_app.ws_ping_interval_ms,
-        g_app.config.mcp_endpoint,
+        esc_mcp,
         g_app.listening_mode == LISTENING_MODE_REALTIME ? "realtime" : "autostop");
     write_file_atomic("/tmp/sair_config.json", buf, len);
 }
@@ -317,6 +355,19 @@ void api_server_check_commands(void)
                 }
             }
         }
+        {
+            int val = 0;
+            if (parse_json_int(buf, "transport_mode", &val) == 0 && val >= 0 && val <= 1)
+            {
+                if (val != g_app.transport_mode)
+                {
+                    PLOG_I(TAG, "transport_mode 变更: %d -> %d", g_app.transport_mode, val);
+                    g_app.transport_mode = val;
+                    g_app.pending_api_transport_change = 1;
+                    api_server_write_config();
+                }
+            }
+        }
     }
     else if (strcmp(cmd, "wakeup") == 0)
     {
@@ -338,8 +389,9 @@ void api_server_check_commands(void)
     }
     else if (strcmp(cmd, "upgrade") == 0)
     {
-        PLOG_I(TAG, "热更新命令已排队");
-        kill(getpid(), SIGUSR2);
+        extern volatile sig_atomic_t g_hot_update_pending;
+        g_hot_update_pending = 1;
+        PLOG_I(TAG, "热更新命令已排队 (g_hot_update_pending=1)");
     }
     else
     {

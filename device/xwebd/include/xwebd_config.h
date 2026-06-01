@@ -12,7 +12,11 @@
 #ifndef XWEBD_CONFIG_H
 #define XWEBD_CONFIG_H
 
-#define XWEBD_VERSION "1.0.0" /* 版本号 */
+#include "version.h"
+
+#ifndef XWEBD_VERSION
+#define XWEBD_VERSION "dev"
+#endif
 
 #define XWEBD_DEFAULT_PORT    8080    /* 默认监听端口 */
 #define XWEBD_REQ_BUF_SIZE    8192    /* HTTP请求缓冲区大小(字节) */
@@ -33,8 +37,8 @@
 #define XWEBD_WATCHDOG_CRASH_LIMIT  5  /* 看门狗: 允许的最大崩溃次数 */
 #define XWEBD_WATCHDOG_CRASH_WINDOW 60 /* 看门狗: 崩溃统计时间窗口(秒) */
 
-#define XWEBD_HEALTH_CHECK_INTERVAL 30  /* 健康检查间隔(秒) */
-#define XWEBD_HEALTH_FAIL_LIMIT     3   /* 连续健康检查失败次数阈值 */
+#define XWEBD_HEALTH_CHECK_INTERVAL 60  /* 健康检查间隔(秒) */
+#define XWEBD_HEALTH_FAIL_LIMIT     5   /* 连续健康检查失败次数阈值 */
 #define XWEBD_MAX_RSS_KB           8192  /* 工作进程最大允许RSS(KB) */
 
 #define XWEBD_TEST_SH        "/var/upgrade/test.sh"     /* 自启动脚本路径 */

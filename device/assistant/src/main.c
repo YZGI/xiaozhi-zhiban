@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file main.c
  * @brief 小智助手主程序入口
  *
@@ -99,7 +99,7 @@ __attribute__((weak)) int sys_is_soft_watchdog_forbid(void) { return 0; }
 
 /* 全局运行标志，0=停止，1=运行中 */
 static volatile int g_running = 0;
-static volatile sig_atomic_t g_hot_update_pending = 0;
+volatile sig_atomic_t g_hot_update_pending = 0;
 
 typedef struct {
     int type;
@@ -181,7 +181,7 @@ app_info_t *g_this_app_info = NULL;
 static int read_precache_enabled(void)
 {
     char buf[256];
-    int fd = open("/var/upgrade/.xwebd_persist", O_RDONLY);
+    int fd = open("/var/upgrade/xwebd_persist.conf", O_RDONLY);
     if (fd < 0)
         return 0;
     int n = read(fd, buf, sizeof(buf) - 1);
@@ -195,25 +195,59 @@ static int read_precache_enabled(void)
     return 0;
 }
 
-static int read_protocol_version(void)
+static int read_transport_mode(void)
 {
-    char buf[256];
-    int fd = open("/var/upgrade/.xwebd_persist", O_RDONLY);
+    char buf[512];
+    int fd = open("/var/upgrade/xwebd_persist.conf", O_RDONLY);
     if (fd < 0)
-        return 1;
+    {
+        PLOG_W("INIT", "无法读取persist文件(errno=%d), 默认WebSocket", errno);
+        return TRANSPORT_MODE_WEBSOCKET;
+    }
     int n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0)
-        return 1;
+    {
+        PLOG_W("INIT", "persist文件为空, 默认WebSocket");
+        return TRANSPORT_MODE_WEBSOCKET;
+    }
     buf[n] = '\0';
-    char *p = strstr(buf, "protocol_version=");
+    char *p = strstr(buf, "transport_mode=");
     if (p)
     {
-        int v = atoi(p + 17);
-        if (v >= 1 && v <= 3)
+        int v = atoi(p + 15);
+        PLOG_I("INIT", "persist中transport_mode=%d", v);
+        if (v >= 0 && v <= 1)
             return v;
     }
-    return 1;
+    else
+    {
+        PLOG_W("INIT", "persist中未找到transport_mode, 默认WebSocket");
+    }
+    return TRANSPORT_MODE_WEBSOCKET;
+}
+
+static void read_custom_ws_url(char *out, int out_size)
+{
+    out[0] = '\0';
+    char buf[1024];
+    int fd = open("/var/upgrade/xwebd_persist.conf", O_RDONLY);
+    if (fd < 0)
+        return;
+    int n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return;
+    buf[n] = '\0';
+    char *p = strstr(buf, "custom_ws_url=");
+    if (p)
+    {
+        p += 14;
+        int i = 0;
+        while (*p && *p != '\n' && *p != '\r' && i < out_size - 1)
+            out[i++] = *p++;
+        out[i] = '\0';
+    }
 }
 
 /**
@@ -225,22 +259,6 @@ static uint64_t get_time_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static void json_extract_str(const char *json, size_t len, const char *field, char *out, int out_size)
-{
-    out[0] = '\0';
-    int field_len = strlen(field);
-    const char *p = memmem(json, len, field, field_len);
-    if (!p)
-        return;
-    p += field_len;
-    while (p < json + len && (*p == ' ' || *p == ':' || *p == '\t' || *p == '"'))
-        p++;
-    int i = 0;
-    while (p < json + len && *p != '"' && i < out_size - 1)
-        out[i++] = *p++;
-    out[i] = '\0';
 }
 
 static void proc_srv_msg(void *req_header_ptr, int *resp_result);
@@ -288,7 +306,6 @@ static void sigusr1_handler(int sig)
 /**
  * @brief 通用信号处理函数
  *        SIGTERM/SIGINT: 设置停止运行标志
- *        SIGUSR2: 设置热更新挂起标志
  * @param sig 信号编号
  */
 static void signal_handler(int sig)
@@ -296,10 +313,6 @@ static void signal_handler(int sig)
     if (sig == SIGTERM || sig == SIGINT)
     {
         g_running = 0;
-    }
-    if (sig == SIGUSR2)
-    {
-        g_hot_update_pending = 1;
     }
 }
 
@@ -366,7 +379,6 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
  *        - 崩溃信号（SIGSEGV/SIGABRT等）：记录崩溃信息
  *        - 终止信号（SIGTERM/SIGINT）：优雅退出
  *        - SIGPIPE：忽略
- *        - SIGUSR2：热更新通知
  *        - SIGUSR1：定时器驱动（不设SA_RESTART以中断poll）
  * @return 0成功
  */
@@ -761,13 +773,16 @@ static void *recorder_thread_func(void *arg)
  * @param packet 音频数据包
  * @param user_data 用户数据，传入app_context_t指针
  */
+static int tts_audio_count = 0;
+
 static void on_proto_audio(audio_packet_t *packet, void *user_data)
 {
     app_context_t *app = (app_context_t *)user_data;
     if (!app || !packet)
         return;
 
-    /* 中止后忽略迟到的TTS音频 */
+    tts_audio_count++;
+
     if (app->ignore_tts_audio)
     {
         PLOG_D("PROTO", "忽略迟到的TTS音频 (中止后), ts=%u size=%d",
@@ -781,7 +796,8 @@ static void on_proto_audio(audio_packet_t *packet, void *user_data)
 
     if (state == kStateListening || state == kStateConnecting)
     {
-        PLOG_I("PROTO", "收到首包音频, 转换到 Speaking 状态");
+        PLOG_I("PROTO", "收到首包音频(#%d), payload=%d字节, 转换到 Speaking 状态",
+               tts_audio_count, packet->payload_size);
         app->player.aborted = false;
         audio_player_reset_decoder(&app->player);
         state_machine_transition(&app->sm, kStateSpeaking);
@@ -789,7 +805,7 @@ static void on_proto_audio(audio_packet_t *packet, void *user_data)
     }
     else if (state == kStateSpeaking && !app->player.playing)
     {
-        PLOG_I("PROTO", "收到音频但播放器未启动, 重新启动");
+        PLOG_I("PROTO", "收到音频(#%d)但播放器未启动, 重新启动", tts_audio_count);
         app->player.aborted = false;
         audio_player_start(&app->player);
     }
@@ -797,7 +813,12 @@ static void on_proto_audio(audio_packet_t *packet, void *user_data)
     state = state_machine_get_state(&app->sm);
     if (state == kStateSpeaking)
     {
-        audio_player_write_opus(&app->player, packet->payload, packet->payload_size, packet->timestamp);
+        int ret = audio_player_write_opus(&app->player, packet->payload, packet->payload_size, packet->timestamp);
+        if (ret != 0 && tts_audio_count <= 10)
+        {
+            PLOG_W("PROTO", "audio_player_write_opus 失败: ret=%d (#%d, size=%d)",
+                   ret, tts_audio_count, packet->payload_size);
+        }
     }
 }
 
@@ -815,12 +836,14 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
         return;
 
     char type_str[64] = {0};
-    json_extract_str(json, len, "\"type\"", type_str, sizeof(type_str));
+    proto_find_json_str(json, len, "type", type_str, sizeof(type_str));
 
     if (strcmp(type_str, "hello") == 0)
     {
-        PLOG_I("PROTO", "收到服务端hello, session=%s sr=%d (唤醒后+%llums)",
+        tts_audio_count = 0;
+        PLOG_I("PROTO", "收到服务端hello, session=%s sr=%d fd=%d (唤醒后+%llums)",
                app->proto.session_id, app->proto.server_sample_rate,
+               app->proto.server_frame_duration,
                (unsigned long long)(get_time_ms() - app->session_start_ms));
 
         if (app->player_initialized)
@@ -870,7 +893,7 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
     else if (strcmp(type_str, "tts") == 0)
     {
         char state_str[32] = {0};
-        json_extract_str(json, len, "\"state\"", state_str, sizeof(state_str));
+        proto_find_json_str(json, len, "state", state_str, sizeof(state_str));
 
         if (strcmp(state_str, "start") == 0)
         {
@@ -912,7 +935,7 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
         else if (strcmp(state_str, "sentence_start") == 0)
         {
             char tts_text[SUBTITLE_MAX_LEN] = {0};
-            json_extract_str(json, len, "\"text\"", tts_text, sizeof(tts_text));
+            proto_find_json_str(json, len, "text", tts_text, sizeof(tts_text));
             PLOG_I("PROTO", "TTS sentence_start: text='%.64s'", tts_text);
             if (tts_text[0])
             {
@@ -923,9 +946,9 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
     else if (strcmp(type_str, "stt") == 0)
     {
         char state_str[32] = {0};
-        json_extract_str(json, len, "\"state\"", state_str, sizeof(state_str));
+        proto_find_json_str(json, len, "state", state_str, sizeof(state_str));
         char stt_text[SUBTITLE_MAX_LEN] = {0};
-        json_extract_str(json, len, "\"text\"", stt_text, sizeof(stt_text));
+        proto_find_json_str(json, len, "text", stt_text, sizeof(stt_text));
         PLOG_I("PROTO", "STT %s text='%.64s'", state_str, stt_text);
         if (stt_text[0])
         {
@@ -935,7 +958,7 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
     else if (strcmp(type_str, "llm") == 0)
     {
         char emotion_str[64] = {0};
-        json_extract_str(json, len, "\"emotion\"", emotion_str, sizeof(emotion_str));
+        proto_find_json_str(json, len, "emotion", emotion_str, sizeof(emotion_str));
         if (emotion_str[0])
         {
             PLOG_I("PROTO", "表情: %s", emotion_str);
@@ -994,7 +1017,7 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
     else if (strcmp(type_str, "listen") == 0)
     {
         char state_str[32] = {0};
-        json_extract_str(json, len, "\"state\"", state_str, sizeof(state_str));
+        proto_find_json_str(json, len, "state", state_str, sizeof(state_str));
         PLOG_I("PROTO", "收到服务端listen: state=%s", state_str);
 
         if (strcmp(state_str, "start") == 0)
@@ -1175,14 +1198,45 @@ static void *ota_thread_func(void *arg)
     while (retries < 3 && g_running)
     {
         config_manager_check_activation(&app->config);
-        if (app->config.has_ws_config)
+        if (app->config.has_ws_config || app->config.has_mqtt_config)
         {
             app->ota_config_received = 1;
-            PLOG_I("OTA", "已获取配置: url=%s", app->config.ws_url);
             break;
         }
         retries++;
         sleep(10);
+    }
+
+    /* 根据OTA响应自适应调整传输模式
+     * 官方OTA同时返回MQTT和WebSocket配置
+     * 优先使用MQTT+UDP：官方服务器主要通过MQTT网关提供服务
+     * 仅在MQTT配置不可用时回退到WebSocket */
+    PLOG_I("OTA", "OTA自适应: transport_mode=%d has_mqtt=%d has_ws=%d",
+            app->transport_mode, app->config.has_mqtt_config, app->config.has_ws_config);
+    if (app->transport_mode == TRANSPORT_MODE_WEBSOCKET && app->config.has_mqtt_config)
+    {
+        if (!app->config.has_ws_config)
+        {
+            PLOG_I("OTA", "用户选择WebSocket但无WS配置, 使用MQTT+UDP");
+            app->transport_mode = TRANSPORT_MODE_MQTT_UDP;
+        }
+    }
+    else if (app->transport_mode == TRANSPORT_MODE_MQTT_UDP && !app->config.has_mqtt_config && app->config.has_ws_config)
+    {
+        PLOG_W("OTA", "OTA未返回MQTT配置但有WebSocket配置, 自动切换到WebSocket模式");
+        app->transport_mode = TRANSPORT_MODE_WEBSOCKET;
+    }
+    else if (app->transport_mode == TRANSPORT_MODE_MQTT_UDP && !app->config.has_mqtt_config && !app->config.has_ws_config)
+    {
+        PLOG_E("OTA", "OTA未返回任何传输配置!");
+    }
+
+    if (app->ota_config_received)
+    {
+        PLOG_I("OTA", "已获取配置: ws_url=%s mqtt=%s transport=%s",
+               app->config.ws_url,
+               app->config.has_mqtt_config ? app->config.mqtt_host : "无",
+               app->transport_mode == TRANSPORT_MODE_MQTT_UDP ? "MQTT+UDP" : "WebSocket");
     }
 
     app->ota_done = 1;
@@ -1226,7 +1280,49 @@ static void *connect_thread_func(void *arg)
     /* 配置协议参数 */
     protocol_config_t proto_config;
     memset(&proto_config, 0, sizeof(proto_config));
-    strncpy(proto_config.url, app->config.ws_url, sizeof(proto_config.url) - 1);
+
+    /* 安全回退：优先MQTT+UDP，WebSocket作为备选 */
+    int effective_transport = app->transport_mode;
+    if (effective_transport == TRANSPORT_MODE_WEBSOCKET && app->config.has_mqtt_config)
+    {
+        if (app->config.has_ws_config)
+        {
+            PLOG_I("CONN", "用户选择WebSocket模式(有WS配置可用)");
+        }
+        else
+        {
+            PLOG_I("CONN", "MQTT+UDP配置可用但无WS配置, 使用MQTT+UDP");
+            effective_transport = TRANSPORT_MODE_MQTT_UDP;
+        }
+    }
+    else if (effective_transport == TRANSPORT_MODE_MQTT_UDP && !app->config.has_mqtt_config && app->config.has_ws_config)
+    {
+        PLOG_W("CONN", "MQTT配置不可用, 回退到WebSocket模式");
+        effective_transport = TRANSPORT_MODE_WEBSOCKET;
+    }
+    proto_config.transport_mode = effective_transport;
+
+    PLOG_I("CONN", "传输模式: %s (配置: mqtt=%s ws=%s)",
+           effective_transport == TRANSPORT_MODE_MQTT_UDP ? "MQTT+UDP" : "WebSocket",
+           app->config.has_mqtt_config ? "有" : "无",
+           app->config.has_ws_config ? "有" : "无");
+
+    if (effective_transport == TRANSPORT_MODE_MQTT_UDP && app->config.has_mqtt_config)
+    {
+        strncpy(proto_config.mqtt_host, app->config.mqtt_host, sizeof(proto_config.mqtt_host) - 1);
+        proto_config.mqtt_port = app->config.mqtt_port;
+        strncpy(proto_config.mqtt_client_id, app->config.mqtt_client_id, sizeof(proto_config.mqtt_client_id) - 1);
+        strncpy(proto_config.mqtt_username, app->config.mqtt_username, sizeof(proto_config.mqtt_username) - 1);
+        strncpy(proto_config.mqtt_password, app->config.mqtt_password, sizeof(proto_config.mqtt_password) - 1);
+        proto_config.mqtt_keepalive = app->config.mqtt_keepalive;
+        strncpy(proto_config.mqtt_subscribe_topic, app->config.mqtt_subscribe_topic, sizeof(proto_config.mqtt_subscribe_topic) - 1);
+        strncpy(proto_config.mqtt_publish_topic, app->config.mqtt_publish_topic, sizeof(proto_config.mqtt_publish_topic) - 1);
+    }
+
+    if (app->custom_ws_url[0])
+        strncpy(proto_config.url, app->custom_ws_url, sizeof(proto_config.url) - 1);
+    else
+        strncpy(proto_config.url, app->config.ws_url, sizeof(proto_config.url) - 1);
     if (app->config.ws_token[0])
     {
         snprintf(proto_config.token, sizeof(proto_config.token), "Bearer %s", app->config.ws_token);
@@ -1247,7 +1343,10 @@ static void *connect_thread_func(void *arg)
         state_machine_transition(&app->sm, kStateCleaning);
         return NULL;
     }
-    app->proto.protocol_version = app->protocol_version;
+
+    PLOG_I("CONN", "protocol_version: %d, channels: %d, listening_mode: %s",
+           app->proto.protocol_version, proto_config.channels,
+           app->listening_mode == LISTENING_MODE_REALTIME ? "realtime" : "autostop");
     app->proto_initialized = 1;
 
     protocol_handler_set_callbacks(&app->proto, NULL, on_proto_disconnected,
@@ -1280,7 +1379,7 @@ static void *connect_thread_func(void *arg)
     }
     if (connect_ret != 0)
     {
-        PLOG_E("CONN", "重试后连接仍失败: %s", websocket_get_error(&app->proto.ws));
+        PLOG_E("CONN", "重试后连接仍失败");
         app->connecting = 0;
         state_machine_transition(&app->sm, kStateCleaning);
         return NULL;
@@ -1600,7 +1699,7 @@ static void on_state_changed(xiaozhi_state_t from, xiaozhi_state_t to, void *use
                 if (protocol_handler_is_connected(&app->proto))
                 {
                     int cached = audio_precache_drain_to_proto(&app->recorder_mod.precache, &app->proto);
-                    (void)cached;
+                    PLOG_I("STATE", "DEBUG: precache排空完成, 发送了%d帧", cached);
                 }
                 else
                 {
@@ -1940,6 +2039,76 @@ static void process_pending_key(app_context_t *app, volatile sig_atomic_t *flag,
  * @brief 早期初始化函数（constructor属性，在main之前执行）
  *        重置崩溃信号处理器为默认值，并强制链接applib符号
  */
+#include <sys/file.h>
+
+static int g_instance_lock_fd = -1;
+
+static int check_single_instance(void)
+{
+    const char *lock_path = "/var/upgrade/sair.pid";
+    int my_pid = getpid();
+
+    g_instance_lock_fd = open(lock_path, O_WRONLY | O_CREAT, 0644);
+    if (g_instance_lock_fd < 0)
+    {
+        PLOG_E("BOOT", "无法打开 %s: %s", lock_path, strerror(errno));
+        return -1;
+    }
+
+    if (flock(g_instance_lock_fd, LOCK_EX | LOCK_NB) != 0)
+    {
+        if (errno == EWOULDBLOCK)
+        {
+            char buf[16];
+            int n = read(g_instance_lock_fd, buf, sizeof(buf) - 1);
+            int old_pid = (n > 0) ? atoi(buf) : 0;
+            PLOG_W("BOOT", "另一个sair实例正在运行 (pid=%d), 终止之", old_pid);
+            close(g_instance_lock_fd);
+            g_instance_lock_fd = -1;
+
+            if (old_pid > 0 && old_pid != my_pid)
+            {
+                kill(old_pid, SIGTERM);
+                usleep(500000);
+                if (kill(old_pid, 0) == 0)
+                {
+                    PLOG_W("BOOT", "sair (pid=%d) 未退出, 强制终止", old_pid);
+                    kill(old_pid, SIGKILL);
+                    usleep(200000);
+                }
+            }
+
+            g_instance_lock_fd = open(lock_path, O_WRONLY | O_CREAT, 0644);
+            if (g_instance_lock_fd < 0)
+                return -1;
+            if (flock(g_instance_lock_fd, LOCK_EX | LOCK_NB) != 0)
+            {
+                PLOG_E("BOOT", "无法获取实例锁: %s", strerror(errno));
+                close(g_instance_lock_fd);
+                g_instance_lock_fd = -1;
+                return -1;
+            }
+        }
+        else
+        {
+            PLOG_E("BOOT", "flock失败: %s", strerror(errno));
+            close(g_instance_lock_fd);
+            g_instance_lock_fd = -1;
+            return -1;
+        }
+    }
+
+    if (ftruncate(g_instance_lock_fd, 0) == 0)
+    {
+        char buf[16];
+        int len = snprintf(buf, sizeof(buf), "%d\n", my_pid);
+        write(g_instance_lock_fd, buf, len);
+    }
+
+    PLOG_I("BOOT", "单实例锁已获取 (pid=%d)", my_pid);
+    return 0;
+}
+
 static void do_hot_update(app_context_t *app)
 {
     struct stat st_sair;
@@ -1984,6 +2153,18 @@ static void do_hot_update(app_context_t *app)
     usleep(500000);
     PLOG_I("OTA", "热更新: 资源已释放, 执行新版本 /var/upgrade/sair");
 
+    unlink("/tmp/sair_status.json");
+    unlink("/tmp/sair_config.json");
+    unlink("/tmp/sair_diag.json");
+    unlink("/tmp/sair_cmd.json");
+
+    if (g_instance_lock_fd >= 0)
+    {
+        flock(g_instance_lock_fd, LOCK_UN);
+        close(g_instance_lock_fd);
+        g_instance_lock_fd = -1;
+    }
+
     int max_fd = sysconf(_SC_OPEN_MAX);
     if (max_fd > 4096)
         max_fd = 4096;
@@ -1994,6 +2175,7 @@ static void do_hot_update(app_context_t *app)
     execvp("/var/upgrade/sair", new_argv);
 
     PLOG_E("OTA", "execvp 失败");
+    _exit(1);
 }
 
 __attribute__((constructor)) static void early_init(void)
@@ -2074,36 +2256,48 @@ int main(int argc, char *argv[])
     plog_init(PLOG_PATH);
     plog_set_level(PLOG_LEVEL_DEBUG);
 
+    {
+        const char *ver_file = "/var/upgrade/.xiaozhi_version";
+        char old_ver[64] = {0};
+        FILE *vfp = fopen(ver_file, "r");
+        if (vfp)
+        {
+            if (fgets(old_ver, sizeof(old_ver), vfp))
+            {
+                int vlen = strlen(old_ver);
+                while (vlen > 0 && (old_ver[vlen - 1] == '\n' || old_ver[vlen - 1] == '\r'))
+                    old_ver[--vlen] = '\0';
+            }
+            fclose(vfp);
+        }
+        if (strcmp(old_ver, XIAOZHI_VERSION) != 0)
+        {
+            plog_close();
+            truncate(PLOG_PATH, 0);
+            plog_init(PLOG_PATH);
+            plog_set_level(PLOG_LEVEL_DEBUG);
+            PLOG_I("BOOT", "版本变更 %s -> %s, 已清除旧日志", old_ver[0] ? old_ver : "(无)", XIAOZHI_VERSION);
+            vfp = fopen(ver_file, "w");
+            if (vfp)
+            {
+                fprintf(vfp, "%s\n", XIAOZHI_VERSION);
+                fclose(vfp);
+            }
+        }
+    }
+
     PLOG_I("BOOT", "========================================");
     PLOG_I("BOOT", "=== 小智助手启动标记 ===");
     PLOG_I("BOOT", "=== pid=%d time=%ld ===", getpid(), (long)time(NULL));
     PLOG_I("BOOT", "========================================");
+
+    check_single_instance();
 
     if (wait_for_network(300) != 0)
     {
         PLOG_W("BOOT", "网络不可用, 30秒后退出等待重启");
         sleep(30);
         return 1;
-    }
-
-    /* 记录系统内存信息 */
-    {
-        FILE *f = fopen("/proc/meminfo", "r");
-        if (f)
-        {
-            char line[256];
-            while (fgets(line, sizeof(line), f))
-            {
-                if (strncmp(line, "MemTotal:", 9) == 0 ||
-                    strncmp(line, "MemFree:", 8) == 0 ||
-                    strncmp(line, "MemAvailable:", 13) == 0)
-                {
-                    line[strcspn(line, "\n")] = 0;
-                    PLOG_I("BOOT", "%s", line);
-                }
-            }
-            fclose(f);
-        }
     }
 
     PLOG_I("MAIN", "小智助手启动中, pid=%d", getpid());
@@ -2230,11 +2424,14 @@ int main(int argc, char *argv[])
     g_app.session_timeout_ms = SESSION_TIMEOUT_MS;
     g_app.wakeup_cooldown_ms = WAKEUP_COOLDOWN_MS;
     g_app.ws_ping_interval_ms = WS_PING_INTERVAL_MS;
-    g_app.listening_mode = LISTENING_MODE_AUTOSTOP;
+    g_app.listening_mode = LISTENING_MODE_REALTIME;
     app->precache_enabled = read_precache_enabled();
     PLOG_I("INIT", "音频预缓存: %s", app->precache_enabled ? "已启用" : "已禁用");
-    app->protocol_version = read_protocol_version();
-    PLOG_I("INIT", "协议版本: v%d", app->protocol_version);
+    app->transport_mode = read_transport_mode();
+    PLOG_I("INIT", "传输模式: %s", app->transport_mode == TRANSPORT_MODE_MQTT_UDP ? "MQTT+UDP" : "WebSocket");
+    read_custom_ws_url(app->custom_ws_url, sizeof(app->custom_ws_url));
+    if (app->custom_ws_url[0])
+        PLOG_I("INIT", "自定义WS URL: %s", app->custom_ws_url);
 
     /* 创建self-pipe用于子线程通知主循环 */
     if (pipe(app->self_pipe) == 0)
@@ -2486,10 +2683,16 @@ int main(int argc, char *argv[])
             state_machine_transition(&app->sm, kStateIdle);
         }
 
-        /* 轮询WebSocket协议数据 */
-        if (app->proto_initialized && websocket_is_connected(&app->proto.ws))
+        if (app->proto_initialized)
         {
-            protocol_handler_poll(&app->proto, 0);
+            if (protocol_handler_is_connected(&app->proto))
+            {
+                protocol_handler_poll(&app->proto, 0);
+            }
+            else if (app->proto.connected)
+            {
+                protocol_handler_poll(&app->proto, 10);
+            }
         }
 
         /* 处理各类挂起事件 */
@@ -2590,6 +2793,23 @@ int main(int argc, char *argv[])
             {
                 app->pending_wakeup = 1;
                 app->pending_wakeup_type = 0;
+            }
+        }
+
+        /* 处理传输模式变更 */
+        if (app->pending_api_transport_change)
+        {
+            app->pending_api_transport_change = 0;
+            PLOG_I("API", "传输模式已变更为 %s, 断开当前连接",
+                   app->transport_mode == TRANSPORT_MODE_MQTT_UDP ? "MQTT+UDP" : "WebSocket");
+            xiaozhi_state_t cur = state_machine_get_state(&app->sm);
+            if (cur == kStateListening || cur == kStateSpeaking || cur == kStateConnecting)
+            {
+                state_machine_transition(&app->sm, kStateCleaning);
+            }
+            else if (app->proto_initialized && protocol_handler_is_connected(&app->proto))
+            {
+                protocol_handler_disconnect(&app->proto);
             }
         }
 
@@ -2732,7 +2952,15 @@ int main(int argc, char *argv[])
 
     applib_quit();
 
+    if (g_instance_lock_fd >= 0)
+    {
+        flock(g_instance_lock_fd, LOCK_UN);
+        close(g_instance_lock_fd);
+        g_instance_lock_fd = -1;
+    }
+
     PLOG_I("MAIN", "小智助手已退出");
     plog_close();
     return 0;
 }
+

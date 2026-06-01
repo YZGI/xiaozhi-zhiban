@@ -12,8 +12,18 @@ typedef struct {
     char ws_token[512];
     char activation_code[64];
     char mcp_endpoint[512];
+    char mqtt_host[128];
+    int mqtt_port;
+    char mqtt_client_id[256];
+    char mqtt_username[512];
+    char mqtt_password[512];
+    int mqtt_keepalive;
+    char mqtt_subscribe_topic[256];
+    char mqtt_publish_topic[256];
+    int has_mqtt_config;
     int has_ws_config;
     int needs_activation;
+    int ws_protocol_version;
 } config_manager_t;
 
 int config_manager_init(config_manager_t* cfg);

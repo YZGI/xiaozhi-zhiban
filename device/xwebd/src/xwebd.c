@@ -76,7 +76,8 @@ static int g_persist_usb_lun = -1;
 static int g_persist_telnet = -1;
 static int g_persist_led = -1;
 static int g_persist_precache = 0;
-static int g_persist_protocol_version = 1;
+static int g_persist_transport_mode = 0;
+static char g_persist_custom_ws_url[512] = "";
 
 static int g_plog_fd = -1;
 static int g_plog_level = 3;
@@ -897,6 +898,9 @@ static int handle_get_services(int fd, const char *body, const char *query) {
         }
     }
 
+    char esc_ws_url[512] = "";
+    json_escape(g_persist_custom_ws_url, esc_ws_url, sizeof(esc_ws_url));
+
     char buf[1024];
     int len = snprintf(buf, sizeof(buf),
         "{\"telnet\":{\"running\":%s},"
@@ -906,7 +910,8 @@ static int handle_get_services(int fd, const char *body, const char *query) {
         "\"usb_lun\":{\"enabled\":%s},"
         "\"led\":{\"enabled\":%s},"
         "\"audio_precache\":{\"enabled\":%s},"
-        "\"protocol_version\":%d,"
+        "\"transport_mode\":%d,"
+        "\"custom_ws_url\":\"%s\","
         "\"key_backlight\":{\"enabled\":%s}}",
         telnet_running ? "true" : "false",
         watchdog_exists ? "true" : "false", watchdog_running ? "true" : "false",
@@ -915,7 +920,8 @@ static int handle_get_services(int fd, const char *body, const char *query) {
         usb_lun_enabled ? "true" : "false",
         led_enabled ? "true" : "false",
         precache_enabled ? "true" : "false",
-        g_persist_protocol_version,
+        g_persist_transport_mode,
+        esc_ws_url,
         key_backlight_enabled == -1 ? "null" : (key_backlight_enabled ? "true" : "false"));
     return send_response(fd, 200, "application/json", buf, len);
 }
@@ -1056,18 +1062,25 @@ static int handle_post_process_control(int fd, const char *body, const char *que
         int len = snprintf(resp, sizeof(resp), "{\"ok\":true,\"action\":\"stop\",\"name\":\"%s\"}", name);
         return send_response(fd, 200, "application/json", resp, len);
     }
-    else if (strcmp(action, "start") == 0) {
+    else if (strcmp(action, "start") == 0 || strcmp(action, "restart") == 0) {
+        if (strcmp(action, "restart") == 0) {
+            char cmd[128];
+            snprintf(cmd, sizeof(cmd), "killall %s 2>/dev/null", name);
+            system(cmd);
+            usleep(500000);
+            XLOG_I(TAG, "进程控制: 重启 %s (已停止)", name);
+        }
         char cmd[128];
         snprintf(cmd, sizeof(cmd), "/usr/bin/%s &", name);
         int rc = system(cmd);
         XLOG_I(TAG, "进程控制: 启动 %s (rc=%d)", name, rc);
         int ok = (rc == 0);
         char resp[256];
-        int len = snprintf(resp, sizeof(resp), "{\"ok\":%s,\"action\":\"start\",\"name\":\"%s\",\"rc\":%d}", ok ? "true" : "false", name, rc);
+        int len = snprintf(resp, sizeof(resp), "{\"ok\":%s,\"action\":\"%s\",\"name\":\"%s\",\"rc\":%d}", ok ? "true" : "false", action, name, rc);
         return send_response(fd, 200, "application/json", resp, len);
     }
     else {
-        return send_error(fd, 400, "Invalid action, use 'stop' or 'start'");
+        return send_error(fd, 400, "Invalid action, use 'stop', 'start' or 'restart'");
     }
 }
 
@@ -1128,23 +1141,36 @@ static int is_usb_data_mode(void) {
 }
 
 static void save_persist_conf(void) {
-    char buf[128];
-    int len = snprintf(buf, sizeof(buf), "usb_lun=%d\ntelnet=%d\nled=%d\nprecache=%d\nprotocol_version=%d\n",
+    char buf[1024];
+    int len = snprintf(buf, sizeof(buf), "usb_lun=%d\ntelnet=%d\nled=%d\nprecache=%d\ntransport_mode=%d\ncustom_ws_url=%s\n",
                        g_persist_usb_lun >= 0 ? g_persist_usb_lun : 0,
                        g_persist_telnet >= 0 ? g_persist_telnet : 1,
                        g_persist_led >= 0 ? g_persist_led : 1,
                        g_persist_precache,
-                       g_persist_protocol_version);
-    int fd = open(XWEBD_PERSIST_CONF, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                       g_persist_transport_mode,
+                       g_persist_custom_ws_url);
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", XWEBD_PERSIST_CONF);
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
-        write(fd, buf, len);
-        close(fd);
-        XLOG_I(TAG, "持久化配置已保存");
+        if (write(fd, buf, len) == len) {
+            close(fd);
+            if (rename(tmp_path, XWEBD_PERSIST_CONF) != 0) {
+                XLOG_E(TAG, "重命名persist配置失败: %s", strerror(errno));
+                unlink(tmp_path);
+            } else {
+                XLOG_I(TAG, "持久化配置已保存");
+            }
+        } else {
+            close(fd);
+            unlink(tmp_path);
+            XLOG_E(TAG, "写入persist配置不完整");
+        }
     }
 }
 
 static void load_persist_conf(void) {
-    char buf[256];
+    char buf[1024];
     int n = read_file_string(XWEBD_PERSIST_CONF, buf, sizeof(buf));
     if (n <= 0) return;
     char *p;
@@ -1156,9 +1182,18 @@ static void load_persist_conf(void) {
     if (p) g_persist_led = atoi(p + 4);
     p = strstr(buf, "precache=");
     if (p) g_persist_precache = atoi(p + 9);
-    p = strstr(buf, "protocol_version=");
-    if (p) { int v = atoi(p + 17); if (v >= 1 && v <= 3) g_persist_protocol_version = v; }
-    XLOG_I(TAG, "持久化配置已加载: usb_lun=%d, telnet=%d, led=%d, precache=%d, protocol_version=%d", g_persist_usb_lun, g_persist_telnet, g_persist_led, g_persist_precache, g_persist_protocol_version);
+    p = strstr(buf, "transport_mode=");
+    if (p) { int v = atoi(p + 15); if (v >= 0 && v <= 1) g_persist_transport_mode = v; }
+    p = strstr(buf, "custom_ws_url=");
+    if (p) {
+        p += 14;
+        int i = 0;
+        while (*p && *p != '\n' && *p != '\r' && i < (int)sizeof(g_persist_custom_ws_url) - 1)
+            g_persist_custom_ws_url[i++] = *p++;
+        g_persist_custom_ws_url[i] = '\0';
+    }
+    XLOG_I(TAG, "持久化配置已加载: usb_lun=%d, telnet=%d, led=%d, precache=%d, transport_mode=%d, custom_ws_url=%s",
+           g_persist_usb_lun, g_persist_telnet, g_persist_led, g_persist_precache, g_persist_transport_mode, g_persist_custom_ws_url);
 }
 
 static void apply_persist_conf(void) {
@@ -1183,6 +1218,9 @@ static void apply_persist_conf(void) {
         }
     }
 }
+
+static int send_sair_cmd(const char *cmd_json, int cmd_len);
+static int signal_sair(const char *sig_name);
 
 static int handle_post_service_toggle(int fd, const char *body, const char *query) {
     char service[32] = "";
@@ -1227,7 +1265,7 @@ static int handle_post_service_toggle(int fd, const char *body, const char *quer
             if (ins_point) {
                 char new_buf[3072];
                 int prefix_len = (int)(ins_point - buf);
-                snprintf(new_buf, sizeof(new_buf), "%.*s/var/upgrade/xwebd -d\n\n%s", prefix_len, buf, ins_point);
+                snprintf(new_buf, sizeof(new_buf), "%.*sif [ -x /var/upgrade/xwebd ]; then cd /var/upgrade && ./xwebd -d; fi\n\n%s", prefix_len, buf, ins_point);
                 int wf = open(XWEBD_TEST_SH, O_WRONLY | O_TRUNC);
                 if (wf >= 0) { write(wf, new_buf, strlen(new_buf)); close(wf); }
             }
@@ -1273,13 +1311,44 @@ static int handle_post_service_toggle(int fd, const char *body, const char *quer
         g_persist_precache = enable;
         save_persist_conf();
         XLOG_I(TAG, "音频预缓存: %s", enable ? "enabled" : "disabled");
-    } else if (strcmp(service, "protocol_version") == 0) {
-        int ver = enable;
-        parse_json_int(body, "value", &ver);
-        if (ver < 1 || ver > 3) return send_error(fd, 400, "protocol_version must be 1, 2 or 3");
-        g_persist_protocol_version = ver;
+    } else if (strcmp(service, "transport_mode") == 0) {
+        int mode = enable;
+        parse_json_int(body, "value", &mode);
+        if (mode < 0 || mode > 1) return send_error(fd, 400, "transport_mode must be 0 (websocket) or 1 (mqtt+udp)");
+        g_persist_transport_mode = mode;
         save_persist_conf();
-        XLOG_I(TAG, "协议版本: %d", ver);
+        XLOG_I(TAG, "传输模式: %s", mode == 1 ? "MQTT+UDP" : "WebSocket");
+        {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd), "{\"cmd\":\"set_config\",\"transport_mode\":%d}", mode);
+            send_sair_cmd(cmd, strlen(cmd));
+            signal_sair("传输模式变更");
+        }
+    } else if (strcmp(service, "custom_ws_url") == 0) {
+        char url[512] = {0};
+        const char *url_key = strstr(body, "\"value\"");
+        if (url_key) {
+            url_key += 7;
+            while (*url_key == ' ' || *url_key == ':' || *url_key == '\t') url_key++;
+            if (*url_key == '"') {
+                url_key++;
+                int i = 0;
+                while (*url_key && *url_key != '"' && i < (int)sizeof(url) - 1)
+                    url[i++] = *url_key++;
+                url[i] = '\0';
+            }
+        }
+        strncpy(g_persist_custom_ws_url, url, sizeof(g_persist_custom_ws_url) - 1);
+        save_persist_conf();
+        XLOG_I(TAG, "自定义WS URL: %s", url);
+        if (url[0]) {
+            char esc_url[1024] = "";
+            json_escape(url, esc_url, sizeof(esc_url));
+            char cmd[1200];
+            snprintf(cmd, sizeof(cmd), "{\"cmd\":\"set_config\",\"ws_url\":\"%s\"}", esc_url);
+            send_sair_cmd(cmd, strlen(cmd));
+            signal_sair("自定义WS URL变更");
+        }
     } else {
         return send_error(fd, 400, "Unknown service");
     }
@@ -1555,9 +1624,12 @@ static int handle_get_files(int fd, const char *body, const char *query) {
     DIR *dir = opendir(resolved);
     if (!dir) return send_error(fd, 404, "Directory not found");
 
+    char esc_path[PATH_MAX];
+    json_escape(resolved, esc_path, sizeof(esc_path));
+
     char buf[XWEBD_RESP_BUF_SIZE];
     int len = 0;
-    APPEND_PRINTF(buf, len, (int)sizeof(buf), "{\"path\":\"%s\",\"files\":[", resolved);
+    APPEND_PRINTF(buf, len, (int)sizeof(buf), "{\"path\":\"%s\",\"files\":[", esc_path);
 
     struct dirent *ent;
     int first = 1;
@@ -1878,9 +1950,9 @@ static int handle_get_assistant_status(int fd, const char *body, const char *que
 
     char buf[4096];
     snprintf(buf, sizeof(buf),
-        "{\"installed\":%s,\"running\":%s,\"native_running\":%s,\"pid\":%d,\"native_backup_exists\":%s,\"state\":\"%s\",\"version\":\"%s\",\"activation_code\":\"%s\",\"activated\":%s,\"ws_url\":\"%s\",\"ws_token\":\"%s\",\"log_level\":\"%s\"}",
+        "{\"installed\":%s,\"running\":%s,\"native_running\":%s,\"pid\":%d,\"native_backup_exists\":%s,\"state\":\"%s\",\"version\":\"%s\",\"activation_code\":\"%s\",\"activated\":%s,\"ws_url\":\"%s\",\"ws_token\":\"%s\",\"log_level\":\"%s\",\"transport_mode\":%d}",
         installed ? "true" : "false", running ? "true" : "false", native_running ? "true" : "false", pid,
-        backup_exists ? "true" : "false", esc_state, esc_version, esc_activation, activated ? "true" : "false", esc_ws_url, esc_ws_token, esc_log_level);
+        backup_exists ? "true" : "false", esc_state, esc_version, esc_activation, activated ? "true" : "false", esc_ws_url, esc_ws_token, esc_log_level, g_persist_transport_mode);
     return send_json(fd, 200, buf);
 }
 
@@ -1941,6 +2013,8 @@ static int handle_get_assistant_logs(int fd, const char *body, const char *query
     return send_response(fd, 200, "application/json", resp, rlen);
 }
 
+static int handle_post_assistant_upgrade(int fd, const char *body, const char *query);
+
 static int handle_post_assistant_deploy(int fd, const char *body, const char *query) {
     if (access(XWEBD_BASE_DIR, W_OK) != 0) {
         mkdir(XWEBD_BASE_DIR, 0755);
@@ -1961,110 +2035,21 @@ static int handle_post_assistant_deploy(int fd, const char *body, const char *qu
     if (access(sair_new_path, R_OK) != 0)
         return send_error(fd, 404, "sair_new not found, upload first");
 
-    int sair_running = 0;
-    int sair_custom = 0;
-    pid_t sair_pid = 0;
-    {
-        char pbuf[16];
-        FILE *pf = popen("pidof sair 2>/dev/null", "r");
-        if (pf) {
-            if (fgets(pbuf, sizeof(pbuf), pf)) { sair_running = 1; sair_pid = atoi(pbuf); }
-            pclose(pf);
-        }
-    }
-
-    if (sair_running && sair_pid > 0) {
-        char exe_path[256] = "";
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/exe 2>/dev/null", sair_pid);
-        FILE *ef = popen(cmd, "r");
-        if (ef) {
-            char ebuf[256];
-            if (fgets(ebuf, sizeof(ebuf), ef)) {
-                char *arrow = strstr(ebuf, "->");
-                if (arrow) {
-                    snprintf(exe_path, sizeof(exe_path), "%s", arrow + 2);
-                    char *nl = strchr(exe_path, '\n');
-                    if (nl) *nl = '\0';
-                    while (*exe_path == ' ') memmove(exe_path, exe_path + 1, strlen(exe_path));
-                }
-            }
-            pclose(ef);
-        }
-        sair_custom = (strstr(exe_path, XWEBD_SAIR_BIN) != NULL);
-    }
-
-    if (sair_running && sair_custom && sair_pid > 0) {
-        {
-            char killcmd[128];
-            snprintf(killcmd, sizeof(killcmd),
-                "for p in $(pidof sair); do [ \"$p\" != \"%d\" ] && kill -9 $p 2>/dev/null; done",
-                sair_pid);
-            system(killcmd);
-        }
-        if (access(XWEBD_SAIR_BIN, X_OK) == 0) {
-            if (rename(XWEBD_SAIR_BIN, XWEBD_SAIR_BACKUP) != 0)
-                XLOG_W(TAG, "备份助手程序失败: %s", strerror(errno));
-        }
-        if (rename(sair_new_path, XWEBD_SAIR_BIN) != 0)
-            return send_error(fd, 500, "Failed to rename sair_new to sair");
-        chmod(XWEBD_SAIR_BIN, 0755);
-        XLOG_I(TAG, "助手部署: 发送SIGUSR2信号到pid %d进行热更新", sair_pid);
-        kill(sair_pid, SIGUSR2);
-        return send_json(fd, 200, "{\"ok\":true,\"method\":\"hot_update\",\"pid\":0}");
-    }
-
-    if (sair_running && !sair_custom) {
-        XLOG_I(TAG, "助手部署: 原生sair运行中(pid=%d)，先停止", sair_pid);
-        kill(sair_pid, SIGTERM);
-        usleep(500000);
-        char pbuf2[16];
-        FILE *pf2 = popen("pidof sair 2>/dev/null", "r");
-        if (pf2) {
-            if (fgets(pbuf2, sizeof(pbuf2), pf2)) {
-                kill(sair_pid, SIGKILL);
-                usleep(300000);
-            }
-            pclose(pf2);
-        }
-    }
-
     if (access(XWEBD_SAIR_BIN, X_OK) == 0) {
         if (rename(XWEBD_SAIR_BIN, XWEBD_SAIR_BACKUP) != 0)
             XLOG_W(TAG, "备份助手程序失败: %s", strerror(errno));
     }
     if (rename(sair_new_path, XWEBD_SAIR_BIN) != 0)
+    {
+        XLOG_E(TAG, "重命名sair_new失败, 尝试恢复备份");
+        if (access(XWEBD_SAIR_BACKUP, R_OK) == 0)
+            rename(XWEBD_SAIR_BACKUP, XWEBD_SAIR_BIN);
         return send_error(fd, 500, "Failed to rename sair_new to sair");
+    }
     chmod(XWEBD_SAIR_BIN, 0755);
 
-    {
-        FILE *tf = popen("grep -q '" XWEBD_SAIR_BIN "' " XWEBD_TEST_SH " 2>/dev/null && echo found || echo missing", "r");
-        int sair_in_test_sh = 0;
-        if (tf) {
-            char tbuf[16];
-            if (fgets(tbuf, sizeof(tbuf), tf) && strncmp(tbuf, "found", 5) == 0)
-                sair_in_test_sh = 1;
-            pclose(tf);
-        }
-        if (sair_in_test_sh) {
-            char sedcmd[256];
-            snprintf(sedcmd, sizeof(sedcmd),
-                "sed -i '/sair/s|.*|sleep 3; killall sair 2>/dev/null; sleep 1; LD_LIBRARY_PATH=/usr/lib:/lib:$LD_LIBRARY_PATH %s >> /var/upgrade/sair_boot.log 2>\\&1 \\&|' " XWEBD_TEST_SH,
-                XWEBD_SAIR_BIN);
-            system(sedcmd);
-            XLOG_I(TAG, "助手部署: 已更新 %s 中的自启动条目", XWEBD_TEST_SH);
-        } else {
-            FILE *af = fopen(XWEBD_TEST_SH, "a");
-            if (af) {
-                fprintf(af, "\nsleep 3; killall sair 2>/dev/null; sleep 1; LD_LIBRARY_PATH=/usr/lib:/lib:$LD_LIBRARY_PATH %s >> /var/upgrade/sair_boot.log 2>&1 &\n", XWEBD_SAIR_BIN);
-                fclose(af);
-                XLOG_I(TAG, "助手部署: 已添加自启动到 %s", XWEBD_TEST_SH);
-            }
-        }
-    }
-
-    XLOG_I(TAG, "助手部署: 文件已放置到 %s, 重启设备以启动", XWEBD_SAIR_BIN);
-    send_json(fd, 200, "{\"ok\":true,\"method\":\"cold_deploy\"}");
+    XLOG_I(TAG, "助手部署: 文件已放置到 %s, PATH优先级使Manager自动启动自定义sair, 重启设备", XWEBD_SAIR_BIN);
+    send_json(fd, 200, "{\"ok\":true,\"method\":\"deploy\"}");
     fsync(fd);
     usleep(100000);
     sync();
@@ -2073,41 +2058,7 @@ static int handle_post_assistant_deploy(int fd, const char *body, const char *qu
 }
 
 static int handle_post_assistant_update(int fd, const char *body, const char *query) {
-    char sair_new_path[PATH_MAX] = XWEBD_BASE_DIR "/sair_new";
-    if (access(sair_new_path, R_OK) != 0)
-        return send_error(fd, 404, "sair_new not found, upload first");
-
-    int sair_running = 0;
-    {
-        char pbuf[16];
-        FILE *pf = popen("pidof sair 2>/dev/null", "r");
-        if (pf) {
-            if (fgets(pbuf, sizeof(pbuf), pf)) sair_running = 1;
-            pclose(pf);
-        }
-    }
-
-    if (sair_running) {
-        XLOG_I(TAG, "助手冷更新: sair运行中, 先停止");
-        system("killall sair 2>/dev/null");
-        usleep(500000);
-    }
-
-    if (access(XWEBD_SAIR_BIN, F_OK) == 0) {
-        if (rename(XWEBD_SAIR_BIN, XWEBD_SAIR_BACKUP) != 0)
-            XLOG_W(TAG, "备份助手程序失败: %s", strerror(errno));
-    }
-    if (rename(sair_new_path, XWEBD_SAIR_BIN) != 0)
-        return send_error(fd, 500, "Failed to rename sair_new to sair");
-    chmod(XWEBD_SAIR_BIN, 0755);
-
-    XLOG_I(TAG, "助手冷更新: 文件已替换, 重启设备");
-    send_json(fd, 200, "{\"ok\":true,\"method\":\"cold_update\"}");
-    fsync(fd);
-    usleep(100000);
-    sync();
-    reboot(RB_AUTOBOOT);
-    return 0;
+    return handle_post_assistant_upgrade(fd, "{\"method\":\"cold\"}", query);
 }
 
 static int handle_post_assistant_uninstall(int fd, const char *body, const char *query) {
@@ -2121,18 +2072,23 @@ static int handle_post_assistant_uninstall(int fd, const char *body, const char 
         }
     }
 
+    int sair_exists = (access(XWEBD_SAIR_BIN, F_OK) == 0);
+    if (!sair_running && !sair_exists)
+        return send_json(fd, 200, "{\"ok\":true,\"message\":\"not_installed\"}");
+
+    send_json(fd, 200, "{\"ok\":true}");
+
     if (sair_running) {
         XLOG_I(TAG, "助手卸载: 正在停止sair...");
         system("killall sair 2>/dev/null");
-        usleep(500000);
+        usleep(300000);
         system("killall -9 sair 2>/dev/null");
-        usleep(500000);
+        usleep(300000);
     }
 
-    if (access(XWEBD_SAIR_BIN, F_OK) == 0) {
-        if (unlink(XWEBD_SAIR_BIN) != 0)
-            return send_error(fd, 500, "Failed to remove sair");
-        XLOG_I(TAG, "助手卸载: 已删除 %s", XWEBD_SAIR_BIN);
+    if (sair_exists) {
+        if (unlink(XWEBD_SAIR_BIN) == 0)
+            XLOG_I(TAG, "助手卸载: 已删除 %s", XWEBD_SAIR_BIN);
     }
 
     if (access(XWEBD_SAIR_BACKUP, F_OK) == 0) {
@@ -2141,26 +2097,31 @@ static int handle_post_assistant_uninstall(int fd, const char *body, const char 
     }
 
     {
-        FILE *tf = popen("grep -q '" XWEBD_SAIR_BIN "' " XWEBD_TEST_SH " 2>/dev/null && echo found || echo missing", "r");
-        int sair_in_test_sh = 0;
-        if (tf) {
-            char tbuf[16];
-            if (fgets(tbuf, sizeof(tbuf), tf) && strncmp(tbuf, "found", 5) == 0)
-                sair_in_test_sh = 1;
-            pclose(tf);
-        }
-        if (sair_in_test_sh) {
-            char cmd[256];
-            snprintf(cmd, sizeof(cmd), "sed -i '/%s/d' %s", "sair", XWEBD_TEST_SH);
-            system(cmd);
-            XLOG_I(TAG, "助手卸载: 已从 %s 移除自启动条目", XWEBD_TEST_SH);
+        const char *cache_files[] = {
+            "/var/upgrade/.mcp_endpoint",
+            "/var/upgrade/.ws_config",
+            "/var/upgrade/.client_id",
+            "/var/upgrade/.xiaozhi_sair",
+            NULL
+        };
+        for (int i = 0; cache_files[i]; i++) {
+            if (access(cache_files[i], F_OK) == 0) {
+                unlink(cache_files[i]);
+                XLOG_I(TAG, "助手卸载: 已删除 %s", cache_files[i]);
+            }
         }
     }
 
-    return send_json(fd, 200, "{\"ok\":true}");
+    g_persist_transport_mode = 0;
+    save_persist_conf();
+    XLOG_I(TAG, "助手卸载: 传输模式已重置为WebSocket");
+
+    return 0;
 }
 
 static int handle_post_assistant_logs_clear(int fd, const char *body, const char *query) {
+    if (access(XWEBD_SAIR_LOG, F_OK) != 0)
+        return send_json(fd, 200, "{\"ok\":true,\"message\":\"log file not found\"}");
     if (truncate(XWEBD_SAIR_LOG, 0) == 0)
         return send_json(fd, 200, "{\"ok\":true}");
     return send_error(fd, 500, "Failed to clear log file");
@@ -2201,6 +2162,13 @@ static int handle_post_assistant_upgrade(int fd, const char *body, const char *q
     if (access(sair_new_path, R_OK) != 0)
         return send_error(fd, 404, "sair_new not found, upload first");
 
+    int want_hot = 1;
+    {
+        char method[16] = "";
+        if (body && parse_json_str(body, "method", method, sizeof(method)) == 0 && strcmp(method, "cold") == 0)
+            want_hot = 0;
+    }
+
     int sair_running = 0;
     int sair_custom = 0;
     pid_t sair_pid = 0;
@@ -2234,7 +2202,18 @@ static int handle_post_assistant_upgrade(int fd, const char *body, const char *q
         sair_custom = (strstr(exe_path, XWEBD_SAIR_BIN) != NULL);
     }
 
-    if (sair_running && sair_custom && sair_pid > 0) {
+    if (rename(XWEBD_SAIR_BIN, XWEBD_SAIR_BACKUP) != 0)
+        XLOG_W(TAG, "备份助手程序失败: %s", strerror(errno));
+    if (rename(sair_new_path, XWEBD_SAIR_BIN) != 0)
+    {
+        XLOG_E(TAG, "重命名sair_new失败, 尝试恢复备份");
+        if (access(XWEBD_SAIR_BACKUP, R_OK) == 0)
+            rename(XWEBD_SAIR_BACKUP, XWEBD_SAIR_BIN);
+        return send_error(fd, 500, "重命名sair_new失败");
+    }
+    chmod(XWEBD_SAIR_BIN, 0755);
+
+    if (want_hot && sair_running && sair_custom && sair_pid > 0) {
         {
             char killcmd[128];
             snprintf(killcmd, sizeof(killcmd),
@@ -2242,26 +2221,15 @@ static int handle_post_assistant_upgrade(int fd, const char *body, const char *q
                 sair_pid);
             system(killcmd);
         }
-        XLOG_I(TAG, "助手升级: 发送SIGUSR2信号到pid %d进行热更新", sair_pid);
-        kill(sair_pid, SIGUSR2);
+        send_sair_cmd("{\"cmd\":\"upgrade\"}", 18);
+        XLOG_I(TAG, "助手热更新: 已替换二进制, 通过cmd.json+SIGUSR1通知pid %d", sair_pid);
+        kill(sair_pid, SIGUSR1);
         return send_json(fd, 200, "{\"ok\":true,\"method\":\"hot_update\"}");
     }
 
-    if (sair_running && !sair_custom) {
-        XLOG_I(TAG, "助手升级: 原生sair运行中(pid=%d)，先停止", sair_pid);
-        kill(sair_pid, SIGTERM);
-        usleep(500000);
-        system("killall -9 sair 2>/dev/null");
-        usleep(300000);
-    }
-
-    if (rename(XWEBD_SAIR_BIN, XWEBD_SAIR_BACKUP) != 0)
-        XLOG_W(TAG, "备份助手程序失败: %s", strerror(errno));
-    if (rename(sair_new_path, XWEBD_SAIR_BIN) != 0)
-        return send_error(fd, 500, "Failed to rename sair_new to sair");
-    chmod(XWEBD_SAIR_BIN, 0755);
-    XLOG_I(TAG, "助手升级: sair未运行, 已替换, 通知manager启动");
-    system("killall -USR1 manager 2>/dev/null");
+    XLOG_I(TAG, "助手冷更新: 已替换二进制, 重启设备");
+    sync();
+    reboot(RB_AUTOBOOT);
     return send_json(fd, 200, "{\"ok\":true,\"method\":\"cold_update\"}");
 }
 
@@ -2320,14 +2288,8 @@ static int handle_post_assistant_activate(int fd, const char *body, const char *
 }
 
 static int handle_get_assistant_config(int fd, const char *body, const char *query) {
-    char pbuf[16];
-    FILE *pf = popen("pidof sair 2>/dev/null", "r");
-    if (!pf) return send_error(fd, 500, "Cannot check sair process");
-    int found = 0;
-    if (fgets(pbuf, sizeof(pbuf), pf)) found = 1;
-    pclose(pf);
-
-    if (!found) return send_error(fd, 404, "sair not running");
+    if (access(XWEBD_SAIR_BIN, F_OK) != 0)
+        return send_json(fd, 200, "{\"ws_url\":\"\",\"ws_token\":\"\",\"log_level\":\"\",\"mcp_endpoint\":\"\",\"listening_mode\":\"\"}");
 
     char buf[2048] = "";
     int cfd = open("/tmp/sair_config.json", O_RDONLY);
@@ -2339,7 +2301,7 @@ static int handle_get_assistant_config(int fd, const char *body, const char *que
             return send_json(fd, 200, buf);
         }
     }
-    return send_error(fd, 502, "Failed to read sair config");
+    return send_json(fd, 200, "{\"ws_url\":\"\",\"ws_token\":\"\",\"log_level\":\"\",\"mcp_endpoint\":\"\",\"listening_mode\":\"\"}");
 }
 
 static int handle_put_assistant_config(int fd, const char *body, const char *query) {
@@ -2378,6 +2340,9 @@ static int handle_put_assistant_config(int fd, const char *body, const char *que
 }
 
 static int handle_get_assistant_diag(int fd, const char *body, const char *query) {
+    if (access(XWEBD_SAIR_BIN, F_OK) != 0)
+        return send_json(fd, 200, "{\"ok_count\":0,\"fail_count\":1,\"total\":1,\"summary\":\"助手未安装\",\"items\":[{\"name\":\"助手状态\",\"ok\":false,\"message\":\"助手未安装\"}]}");
+
     char pbuf[16];
     FILE *pf = popen("pidof sair 2>/dev/null", "r");
     if (!pf) return send_error(fd, 500, "Cannot check sair process");
@@ -2386,7 +2351,7 @@ static int handle_get_assistant_diag(int fd, const char *body, const char *query
     if (fgets(pbuf, sizeof(pbuf), pf)) { found = 1; sair_pid = atoi(pbuf); }
     pclose(pf);
 
-    if (!found) return send_error(fd, 404, "sair not running");
+    if (!found) return send_json(fd, 200, "{\"ok_count\":0,\"fail_count\":1,\"total\":1,\"summary\":\"助手未运行\",\"items\":[{\"name\":\"助手状态\",\"ok\":false,\"message\":\"助手未运行\"}]}");
 
     int req_fd = open("/tmp/sair_diag_request", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (req_fd >= 0) close(req_fd);
@@ -2405,7 +2370,7 @@ static int handle_get_assistant_diag(int fd, const char *body, const char *query
             return send_json(fd, 200, buf);
         }
     }
-    return send_error(fd, 502, "Failed to get sair diag");
+    return send_json(fd, 200, "{\"ok_count\":0,\"fail_count\":1,\"total\":1,\"summary\":\"诊断信息不可用\",\"items\":[{\"name\":\"诊断\",\"ok\":false,\"message\":\"无法读取诊断信息\"}]}");
 }
 
 /* ===== 路由表 ===== */
@@ -2431,13 +2396,12 @@ static int handle_post_self_update(int fd, const char *body, const char *query) 
     }
     chmod(self_path, 0755);
 
-    XLOG_I(TAG, "自更新: 二进制已替换, 设备将重启");
-    send_json(fd, 200, "{\"ok\":true}");
+    XLOG_I(TAG, "自更新冷更新: 二进制已替换, 重启设备");
+    send_json(fd, 200, "{\"ok\":true,\"method\":\"cold_update\"}");
     fsync(fd);
     usleep(100000);
     sync();
     reboot(RB_AUTOBOOT);
-    g_running = 0;
     return 0;
 }
 
@@ -2882,12 +2846,14 @@ static void cleanup_startup_residuals(void) {
 }
 
 static void signal_handler(int sig) {
-    if (sig == SIGTERM) {
+    if (sig == SIGTERM || sig == SIGINT) {
+        XLOG_I(TAG, "收到信号 %d, 设置g_running=0", sig);
         g_running = 0;
     }
 }
 
 static void worker_loop(void) {
+    g_running = 1;
     prctl(PR_SET_PDEATHSIG, SIGTERM);
 
     xlog_init(NULL);
@@ -2960,7 +2926,7 @@ static void worker_loop(void) {
 
     close(g_server_fd);
     xlog_close();
-    XLOG_I(TAG, "xwebd工作进程正常退出");
+    XLOG_I(TAG, "xwebd工作进程退出 (g_running=%d)", g_running);
 }
 
 static void print_usage(const char *prog) {
@@ -2970,13 +2936,34 @@ static void print_usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    int is_worker = 0;
+    int new_argc = 1;
+    char *new_argv[argc + 1];
+    new_argv[0] = argv[0];
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--worker") == 0) { is_worker = 1; continue; }
+        new_argv[new_argc++] = argv[i];
+    }
+    new_argv[new_argc] = NULL;
+
     int opt;
-    while ((opt = getopt(argc, argv, "p:d")) != -1) {
+    while ((opt = getopt(new_argc, new_argv, "p:d")) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 'd': g_daemon = 1; break;
             default: print_usage(argv[0]); return 1;
         }
+    }
+
+    if (is_worker) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = signal_handler;
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+        signal(SIGPIPE, SIG_IGN);
+        worker_loop();
+        return 0;
     }
 
     if (g_daemon) {
@@ -3017,6 +3004,7 @@ int main(int argc, char *argv[]) {
 
     while (1) {
         int status;
+
         pid_t ret = waitpid(worker_pid, &status, WNOHANG);
         if (ret < 0) {
             if (errno == EINTR) { sleep(1); continue; }
@@ -3066,8 +3054,15 @@ int main(int argc, char *argv[]) {
                 break;
             }
             if (worker_pid == 0) {
+                char self_path[512];
+                int n = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+                if (n > 0) {
+                    self_path[n] = '\0';
+                    char *child_argv[] = {self_path, "--worker", NULL};
+                    execvp(self_path, child_argv);
+                }
                 worker_loop();
-                _exit(0);
+                _exit(1);
             }
             XLOG_I(TAG, "工作进程已重启, 新pid=%d", worker_pid);
             last_health_check = time(NULL);
@@ -3082,10 +3077,13 @@ int main(int argc, char *argv[]) {
 
             int need_restart = 0;
 
-            {
+            if (worker_pid > 0 && kill(worker_pid, 0) != 0) {
+                health_fail_count++;
+                XLOG_W(TAG, "健康检查: 工作进程不存在 (%d/%d)", health_fail_count, XWEBD_HEALTH_FAIL_LIMIT);
+            } else if (worker_pid > 0) {
                 int sock = socket(AF_INET, SOCK_STREAM, 0);
                 if (sock >= 0) {
-                    struct timeval tv = {2, 0};
+                    struct timeval tv = {5, 0};
                     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
                     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
                     struct sockaddr_in addr;
