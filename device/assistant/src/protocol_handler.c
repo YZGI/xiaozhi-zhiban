@@ -379,7 +379,7 @@ static void *send_thread_func(void *arg)
         {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 10000000;
+            ts.tv_nsec += 100000000;
             if (ts.tv_nsec >= 1000000000)
             {
                 ts.tv_sec++;

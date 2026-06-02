@@ -135,7 +135,8 @@ void api_server_write_config(void)
         "{\"ws_url\":\"%s\",\"ws_token\":\"%s\",\"log_level\":\"%s\","
         "\"listen_timeout\":%llu,\"session_timeout\":%llu,"
         "\"wakeup_cooldown\":%llu,\"ws_ping_interval\":%llu,"
-        "\"mcp_endpoint\":\"%s\",\"listening_mode\":\"%s\"}\n",
+        "\"mcp_endpoint\":\"%s\",\"listening_mode\":\"%s\","
+        "\"transport_mode\":%d}\n",
         esc_ws_url,
         esc_ws_token,
         plog_lvl == PLOG_LEVEL_DEBUG ? "DEBUG" :
@@ -146,7 +147,8 @@ void api_server_write_config(void)
         (unsigned long long)g_app.wakeup_cooldown_ms,
         (unsigned long long)g_app.ws_ping_interval_ms,
         esc_mcp,
-        g_app.listening_mode == LISTENING_MODE_REALTIME ? "realtime" : "autostop");
+        g_app.listening_mode == LISTENING_MODE_REALTIME ? "realtime" : "autostop",
+        g_app.transport_mode);
     write_file_atomic("/tmp/sair_config.json", buf, len);
 }
 

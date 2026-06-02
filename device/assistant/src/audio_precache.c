@@ -142,7 +142,7 @@ int audio_precache_drain_to_proto(audio_precache_t *pc, void *proto_ptr)
 
     pthread_mutex_unlock(&pc->mutex);
 
-    PLOG_I("PRECACHE", "开始排空: %d帧 (跳过=%d, 约%dms), 按帧间隔发送",
+    PLOG_I("PRECACHE", "开始排空: %d帧 (跳过=%d, 约%dms)",
            drain_count, skipped, drain_count * 60);
 
     int sent = 0;
@@ -155,9 +155,6 @@ int audio_precache_drain_to_proto(audio_precache_t *pc, void *proto_ptr)
             sent++;
         else
             PLOG_W("PRECACHE", "排空发送失败 (帧%d/%d)", i + 1, drain_count);
-
-        if (i < drain_count - 1)
-            usleep(60000);
     }
 
     PLOG_I("PRECACHE", "排空完成: 发送%d/%d帧 (跳过%d帧)", sent, total - skipped, skipped);

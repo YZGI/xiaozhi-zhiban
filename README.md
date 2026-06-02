@@ -24,6 +24,7 @@
 - 📊 **实时监控** — 设备状态、日志、配置一览无余
 - ⚙️ **运行时配置** — WebSocket 地址、超时参数、日志级别等均可在线调整
 - 🔌 **双协议栈** — 支持 WebSocket 和 MQTT+UDP 双协议栈，MQTT 用于控制信令，UDP 用于 AES-128-CTR 加密音频传输；当前仅 WebSocket 模式可用（MQTT+UDP 因官方网关兼容性暂不可用）；assistant 与 xwebd 通过文件 IPC 通信
+- ⚡ **低功耗优化** — 动态 poll 超时（空闲200ms/活跃50ms）、发送线程低频唤醒、WebSocket 帧掩码零文件I/O、MQTT 栈缓冲区、线程栈精简，最大化 CPU 深睡眠时间
 - 🔗 **MCP 接入点** — 支持配置 xiaozhi.me 智能体专属 MCP 端点，实现工具调用能力扩展
 - 🧪 **自检诊断** — 分层自检架构，部署前验证环境兼容性
 
@@ -327,7 +328,7 @@ assistant 主循环检测到 g_hot_update_pending:
 
 **为什么不用 kill + restart**：kill 后 PID 变化 → Manager 检测 WIFSIGNALED → reboot；SCHED_RR 调度丢失；kill 到新进程启动有间隙 → 看门狗超时。
 
-> ⚠️ **版本号自动递增**：build.sh 编译时自动生成 `version.h`，通过 `.version` 文件管理版本号，采用进位逻辑（每位到10进位，如 2.1.9 → 2.2.0）。当前 assistant 版本 2.1.x，xwebd 版本 1.1.x。
+> ⚠️ **版本号自动递增**：build.sh 编译时自动生成 `version.h`，通过 `.version` 文件管理版本号，采用进位逻辑（每位到10进位，如 2.1.9 → 2.2.0）。当前 assistant 版本 2.2.x，xwebd 版本 1.1.x。
 >
 > `.version` 文件需提交到仓库，确保不同环境编译时版本号一致。
 

@@ -204,20 +204,8 @@ static int ws_poll_raw(websocket_t *ws, int timeout_ms)
 static void ws_generate_key(char *key, int key_len)
 {
     uint8_t rand_bytes[16];
-    /* 优先从/dev/urandom读取随机数 */
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0)
-    {
-        read(fd, rand_bytes, sizeof(rand_bytes));
-        close(fd);
-    }
-    else
-    {
-        /* 回退到伪随机数 */
-        srand(time(NULL));
-        for (int i = 0; i < 16; i++)
-            rand_bytes[i] = rand() & 0xFF;
-    }
+    for (int i = 0; i < 16; i++)
+        rand_bytes[i] = (uint8_t)(rand() & 0xFF);
 
     /* 将16字节随机数编码为Base64字符串 */
     static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -402,17 +390,8 @@ static int ws_send_frame(websocket_t *ws, int opcode, const uint8_t *payload, si
 
     /* 生成掩码密钥（客户端发送的帧必须掩码） */
     uint8_t mask_key[4];
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0)
-    {
-        read(fd, mask_key, 4);
-        close(fd);
-    }
-    else
-    {
-        for (int i = 0; i < 4; i++)
-            mask_key[i] = rand();
-    }
+    for (int i = 0; i < 4; i++)
+        mask_key[i] = (uint8_t)(rand() & 0xFF);
 
     /* 根据负载长度编码帧头 */
     if (payload_len <= 125)

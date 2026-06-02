@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file main.c
  * @brief 小智助手主程序入口
  *
@@ -924,7 +924,8 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
             else
             {
                 PLOG_I("PROTO", "TTS 结束 (正常完成)");
-                audio_player_stop_with_wait(&app->player, true);
+                bool wait_play = (app->listening_mode != LISTENING_MODE_REALTIME);
+                audio_player_stop_with_wait(&app->player, wait_play);
                 xiaozhi_state_t cur_state = state_machine_get_state(&app->sm);
                 if (cur_state != kStateCleaning)
                 {
@@ -1032,7 +1033,10 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
                 if (protocol_handler_is_connected(&app->proto))
                 {
                     protocol_handler_send_abort(&app->proto, "server_listening");
-                    protocol_handler_clear_send_queue(&app->proto);
+                    if (app->listening_mode != LISTENING_MODE_REALTIME)
+                    {
+                        protocol_handler_clear_send_queue(&app->proto);
+                    }
                 }
                 state_machine_transition(&app->sm, kStateListening);
             }
@@ -1943,10 +1947,14 @@ static void process_pending_wakeup(app_context_t *app)
         if (protocol_handler_is_connected(&app->proto))
         {
             protocol_handler_send_abort(&app->proto, "wake_word_detected");
-            protocol_handler_clear_send_queue(&app->proto);
+            if (app->listening_mode != LISTENING_MODE_REALTIME)
+            {
+                protocol_handler_clear_send_queue(&app->proto);
+            }
         }
         broadcast_sair_awake(app->pending_wakeup_type);
-        if (app->recorder_initialized && app->precache_enabled)
+        if (app->recorder_initialized && app->precache_enabled
+            && app->listening_mode != LISTENING_MODE_REALTIME)
         {
             audio_precache_start(&app->recorder_mod.precache);
         }
@@ -2074,18 +2082,30 @@ static int check_single_instance(void)
                 {
                     PLOG_W("BOOT", "sair (pid=%d) 未退出, 强制终止", old_pid);
                     kill(old_pid, SIGKILL);
-                    usleep(200000);
+                    usleep(500000);
                 }
             }
 
-            g_instance_lock_fd = open(lock_path, O_WRONLY | O_CREAT, 0644);
-            if (g_instance_lock_fd < 0)
-                return -1;
-            if (flock(g_instance_lock_fd, LOCK_EX | LOCK_NB) != 0)
+            int lock_retries = 5;
+            while (lock_retries > 0)
             {
-                PLOG_E("BOOT", "无法获取实例锁: %s", strerror(errno));
+                g_instance_lock_fd = open(lock_path, O_WRONLY | O_CREAT, 0644);
+                if (g_instance_lock_fd < 0)
+                    return -1;
+                if (flock(g_instance_lock_fd, LOCK_EX | LOCK_NB) == 0)
+                    break;
                 close(g_instance_lock_fd);
                 g_instance_lock_fd = -1;
+                lock_retries--;
+                if (lock_retries > 0)
+                {
+                    PLOG_I("BOOT", "实例锁仍被占用, 等待1秒 (剩余重试%d次)", lock_retries);
+                    sleep(1);
+                }
+            }
+            if (lock_retries <= 0)
+            {
+                PLOG_E("BOOT", "无法获取实例锁: %s", strerror(errno));
                 return -1;
             }
         }
@@ -2254,7 +2274,7 @@ int main(int argc, char *argv[])
     int ret;
 
     plog_init(PLOG_PATH);
-    plog_set_level(PLOG_LEVEL_DEBUG);
+    plog_set_level(PLOG_LEVEL_INFO);
 
     {
         const char *ver_file = "/var/upgrade/.xiaozhi_version";
@@ -2277,6 +2297,7 @@ int main(int argc, char *argv[])
             plog_init(PLOG_PATH);
             plog_set_level(PLOG_LEVEL_DEBUG);
             PLOG_I("BOOT", "版本变更 %s -> %s, 已清除旧日志", old_ver[0] ? old_ver : "(无)", XIAOZHI_VERSION);
+            plog_set_level(PLOG_LEVEL_INFO);
             vfp = fopen(ver_file, "w");
             if (vfp)
             {
@@ -2290,6 +2311,8 @@ int main(int argc, char *argv[])
     PLOG_I("BOOT", "=== 小智助手启动标记 ===");
     PLOG_I("BOOT", "=== pid=%d time=%ld ===", getpid(), (long)time(NULL));
     PLOG_I("BOOT", "========================================");
+
+    srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
 
     check_single_instance();
 
@@ -2537,6 +2560,8 @@ int main(int argc, char *argv[])
         }
     }
 
+    api_server_write_config();
+
     /* 初始化音频分发器 */
     audio_dispatcher_init(&app->audio_disp);
     heap_check("pre-wakeup");
@@ -2601,7 +2626,7 @@ int main(int argc, char *argv[])
     {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, 128 * 1024);
+        pthread_attr_setstacksize(&attr, 64 * 1024);
         pthread_create(&app->recorder_thread, &attr, recorder_thread_func, app);
         pthread_attr_destroy(&attr);
         {
@@ -2612,7 +2637,7 @@ int main(int argc, char *argv[])
             else
                 PLOG_W("INIT", "录音线程设置调度策略失败");
         }
-        PLOG_I("INIT", "音频录音线程已启动 (128KB栈)");
+        PLOG_I("INIT", "音频录音线程已启动 (64KB栈)");
     }
 
     /* 启动OTA线程 */
@@ -2638,10 +2663,10 @@ int main(int argc, char *argv[])
         app->msg_thread_running = 1;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, 128 * 1024);
+        pthread_attr_setstacksize(&attr, 64 * 1024);
         pthread_create(&app->msg_thread, &attr, msg_thread_func, app);
         pthread_attr_destroy(&attr);
-        PLOG_I("INIT", "消息接收线程已启动 (128KB栈)");
+        PLOG_I("INIT", "消息接收线程已启动 (64KB栈)");
     }
 
     PLOG_I("MAIN", "进入事件循环 (非阻塞)");
@@ -2687,11 +2712,11 @@ int main(int argc, char *argv[])
         {
             if (protocol_handler_is_connected(&app->proto))
             {
-                protocol_handler_poll(&app->proto, 0);
+                protocol_handler_poll(&app->proto, 10);
             }
             else if (app->proto.connected)
             {
-                protocol_handler_poll(&app->proto, 10);
+                protocol_handler_poll(&app->proto, 50);
             }
         }
 
@@ -2892,10 +2917,18 @@ int main(int argc, char *argv[])
         }
 
         {
+            xiaozhi_state_t cur_state = state_machine_get_state(&app->sm);
+            int poll_ms = (cur_state == kStateListening || cur_state == kStateSpeaking || cur_state == kStateConnecting) ? 50 : 200;
             struct pollfd pfd;
             pfd.fd = app->self_pipe[0];
             pfd.events = POLLIN;
-            poll(&pfd, 1, 50);
+            poll(&pfd, 1, poll_ms);
+        }
+
+        if (g_sigusr1_received)
+        {
+            g_sigusr1_received = 0;
+            api_server_check_commands();
         }
     }
 

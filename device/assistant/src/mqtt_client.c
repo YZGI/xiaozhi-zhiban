@@ -490,7 +490,8 @@ int mqtt_client_publish(mqtt_client_t *client, const char *topic, const char *pa
     int remaining = var_header_len + payload_len;
     int buf_size = 1 + 4 + remaining;
 
-    uint8_t *packet = (uint8_t *)malloc(buf_size);
+    uint8_t stack_buf[512];
+    uint8_t *packet = (buf_size <= (int)sizeof(stack_buf)) ? stack_buf : (uint8_t *)malloc(buf_size);
     if (!packet) {
         PLOG_E("MQTT", "PUBLISH内存分配失败: %d", buf_size);
         return -1;
@@ -504,7 +505,7 @@ int mqtt_client_publish(mqtt_client_t *client, const char *topic, const char *pa
     pos += payload_len;
 
     int ret = mqtt_send_packet(client, packet, pos);
-    free(packet);
+    if (packet != stack_buf) free(packet);
     return ret;
 }
 

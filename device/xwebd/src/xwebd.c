@@ -80,13 +80,21 @@ static int g_persist_transport_mode = 0;
 static char g_persist_custom_ws_url[512] = "";
 
 static int g_plog_fd = -1;
-static int g_plog_level = 3;
+static int g_plog_level = 2;
 static pthread_mutex_t g_plog_mutex = PTHREAD_MUTEX_INITIALIZER;
 static off_t g_plog_size = 0;
 static char g_plog_path[256] = XWEBD_LOG_PATH;
+static struct timespec g_plog_last_sync = {0, 0};
 
 static int g_watchdog_crash_count = 0;
 static time_t g_watchdog_crash_start = 0;
+
+static int g_cached_cpu_usage = -1;
+static long long g_cpu_prev_user = 0, g_cpu_prev_nice = 0, g_cpu_prev_sys = 0, g_cpu_prev_idle = 0;
+static int g_cpu_first_read = 1;
+
+static int g_led_pending_value = -1;
+static time_t g_led_retry_time = 0;
 
 /* ===== 日志系统 ===== */
 
@@ -104,7 +112,7 @@ static void xlog_rotate(void) {
 
     int src_fd = open(g_plog_path, O_RDONLY);
     if (src_fd < 0) {
-        g_plog_fd = open(g_plog_path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, 0644);
+        g_plog_fd = open(g_plog_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         g_plog_size = 0;
         return;
     }
@@ -116,7 +124,7 @@ static void xlog_rotate(void) {
     char *buf = malloc(XWEBD_LOG_KEEP_SIZE);
     if (!buf) {
         close(src_fd);
-        g_plog_fd = open(g_plog_path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, 0644);
+        g_plog_fd = open(g_plog_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         g_plog_size = 0;
         return;
     }
@@ -136,7 +144,7 @@ static void xlog_rotate(void) {
         if (nl) { start = nl + 1; total_read -= (start - buf); }
     }
 
-    g_plog_fd = open(g_plog_path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, 0644);
+    g_plog_fd = open(g_plog_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (g_plog_fd >= 0 && total_read > 0) {
         write(g_plog_fd, start, total_read);
         g_plog_size = total_read;
@@ -150,7 +158,7 @@ static void xlog_init(const char *path) {
     pthread_mutex_lock(&g_plog_mutex);
     if (g_plog_fd >= 0) close(g_plog_fd);
     if (path) { strncpy(g_plog_path, path, sizeof(g_plog_path) - 1); g_plog_path[sizeof(g_plog_path) - 1] = '\0'; }
-    g_plog_fd = open(g_plog_path, O_WRONLY | O_CREAT | O_APPEND | O_SYNC, 0644);
+    g_plog_fd = open(g_plog_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (g_plog_fd >= 0) {
         struct stat st;
         if (fstat(g_plog_fd, &st) == 0) g_plog_size = st.st_size;
@@ -193,6 +201,12 @@ static void xlog_vwrite(int level, const char *tag, const char *fmt, va_list ap)
         xlog_rotate();
         int w = write(g_plog_fd, buf, len);
         if (w > 0) g_plog_size += w;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec - g_plog_last_sync.tv_sec >= 1) {
+            fdatasync(g_plog_fd);
+            g_plog_last_sync = now;
+        }
     }
     pthread_mutex_unlock(&g_plog_mutex);
 }
@@ -202,6 +216,78 @@ static void xlog_write(int level, const char *tag, const char *fmt, ...) {
     va_start(ap, fmt);
     xlog_vwrite(level, tag, fmt, ap);
     va_end(ap);
+}
+
+/* ===== CPU增量采样(无需线程) ===== */
+
+static void cpu_sample_update(void) {
+    FILE *sf = fopen("/proc/stat", "r");
+    if (!sf) return;
+    long long user, nice, sys, idle;
+    if (fscanf(sf, "cpu %lld %lld %lld %lld", &user, &nice, &sys, &idle) == 4) {
+        if (g_cpu_first_read) {
+            g_cpu_first_read = 0;
+        } else {
+            long long d_total = (user - g_cpu_prev_user) + (nice - g_cpu_prev_nice) + (sys - g_cpu_prev_sys) + (idle - g_cpu_prev_idle);
+            long long d_idle = idle - g_cpu_prev_idle;
+            if (d_total > 0)
+                g_cached_cpu_usage = (int)(100 * (d_total - d_idle) / d_total);
+        }
+        g_cpu_prev_user = user; g_cpu_prev_nice = nice; g_cpu_prev_sys = sys; g_cpu_prev_idle = idle;
+    }
+    fclose(sf);
+}
+
+/* ===== 进程查找(替代popen pidof) ===== */
+
+static pid_t find_pid_by_name(const char *name) {
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_type != DT_DIR) continue;
+        char *end;
+        long pid = strtol(ent->d_name, &end, 10);
+        if (*end != '\0' || pid <= 0) continue;
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%ld/comm", pid);
+        char comm[256];
+        int fd = open(comm_path, O_RDONLY);
+        if (fd < 0) continue;
+        int n = read(fd, comm, sizeof(comm) - 1);
+        close(fd);
+        if (n <= 0) continue;
+        comm[n] = '\0';
+        if (comm[n - 1] == '\n') comm[n - 1] = '\0';
+        if (strcmp(comm, name) == 0) { closedir(d); return (pid_t)pid; }
+    }
+    closedir(d);
+    return 0;
+}
+
+static pid_t find_pid_by_cmdline(const char *substr) {
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_type != DT_DIR) continue;
+        char *end;
+        long pid = strtol(ent->d_name, &end, 10);
+        if (*end != '\0' || pid <= 0) continue;
+        char cmdline_path[64];
+        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%ld/cmdline", pid);
+        char cmdline[512];
+        int fd = open(cmdline_path, O_RDONLY);
+        if (fd < 0) continue;
+        int n = read(fd, cmdline, sizeof(cmdline) - 1);
+        close(fd);
+        if (n <= 0) continue;
+        cmdline[n] = '\0';
+        for (int i = 0; i < n - 1; i++) { if (cmdline[i] == '\0') cmdline[i] = ' '; }
+        if (strstr(cmdline, substr)) { closedir(d); return (pid_t)pid; }
+    }
+    closedir(d);
+    return 0;
 }
 
 /* ===== 呼吸灯控制 ===== */
@@ -656,34 +742,12 @@ static int handle_get_system(int fd, const char *body, const char *query) {
 
     if (access(XWEBD_SAIR_BIN, X_OK) == 0) {
         assistant_installed = 1;
-        char pid_buf[16];
-        FILE *pf = popen("pidof sair 2>/dev/null", "r");
-        if (pf) {
-            if (fgets(pid_buf, sizeof(pid_buf), pf)) assistant_running = 1;
-            pclose(pf);
-        }
+        if (find_pid_by_name("sair_main") > 0 || find_pid_by_name("sair") > 0)
+            assistant_running = 1;
     }
 
-    {
-        FILE *sf = fopen("/proc/stat", "r");
-        if (sf) {
-            long long user1, nice1, sys1, idle1;
-            if (fscanf(sf, "cpu %lld %lld %lld %lld", &user1, &nice1, &sys1, &idle1) == 4) {
-                fclose(sf);
-                usleep(200000);
-                sf = fopen("/proc/stat", "r");
-                if (sf) {
-                    long long user2, nice2, sys2, idle2;
-                    if (fscanf(sf, "cpu %lld %lld %lld %lld", &user2, &nice2, &sys2, &idle2) == 4) {
-                        long long d_total = (user2 - user1) + (nice2 - nice1) + (sys2 - sys1) + (idle2 - idle1);
-                        long long d_idle = idle2 - idle1;
-                        if (d_total > 0) cpu_usage = (int)(100 * (d_total - d_idle) / d_total);
-                    }
-                }
-            }
-            if (sf) fclose(sf);
-        }
-    }
+    cpu_sample_update();
+    cpu_usage = g_cached_cpu_usage;
 
     {
         char bl_buf[8] = {0};
@@ -846,17 +910,9 @@ static int handle_get_logs(int fd, const char *body, const char *query) {
 }
 
 static int handle_get_services(int fd, const char *body, const char *query) {
-    int telnet_running = 0;
-    {
-        FILE *pf = popen("pidof telnetd 2>/dev/null", "r");
-        if (pf) { char pbuf[16]; if (fgets(pbuf, sizeof(pbuf), pf)) telnet_running = 1; pclose(pf); }
-    }
+    int telnet_running = (find_pid_by_name("telnetd") > 0);
     int watchdog_exists = (access(XWEBD_WATCHDOG_SH, X_OK) == 0);
-    int watchdog_running = 0;
-    {
-        FILE *pf = popen("pidof -s boot_watchdog.sh 2>/dev/null; pidof -s boot_watchdog 2>/dev/null", "r");
-        if (pf) { char pbuf[16]; if (fgets(pbuf, sizeof(pbuf), pf)) watchdog_running = 1; pclose(pf); }
-    }
+    int watchdog_running = (find_pid_by_name("boot_watchdog") > 0 || find_pid_by_cmdline("boot_watchdog.sh") > 0);
     int xwebd_autostart = 0;
     {
         char buf2[1024];
@@ -864,16 +920,8 @@ static int handle_get_services(int fd, const char *body, const char *query) {
         if (n > 0 && strstr(buf2, "xwebd")) xwebd_autostart = 1;
     }
     int sair_installed = (access(XWEBD_SAIR_BIN, X_OK) == 0);
-    int sair_running = 0;
-    {
-        FILE *pf = popen("pidof sair 2>/dev/null", "r");
-        if (pf) { char pbuf[16]; if (fgets(pbuf, sizeof(pbuf), pf)) sair_running = 1; pclose(pf); }
-    }
-    int xwebd_running = 0;
-    {
-        FILE *pf = popen("pidof xwebd 2>/dev/null", "r");
-        if (pf) { char pbuf[16]; if (fgets(pbuf, sizeof(pbuf), pf)) xwebd_running = 1; pclose(pf); }
-    }
+    int sair_running = (find_pid_by_name("sair_main") > 0 || find_pid_by_name("sair") > 0);
+    int xwebd_running = (find_pid_by_name("xwebd") > 0);
     int usb_lun_enabled = 0;
     {
         char lun_buf[256] = "";
@@ -1204,7 +1252,7 @@ static void apply_persist_conf(void) {
         }
     }
     if (g_persist_led >= 0) {
-        int retries = 5;
+        int retries = 3;
         while (retries > 0) {
             if (send_led_cmd(g_persist_led) == 0) break;
             retries--;
@@ -1214,7 +1262,9 @@ static void apply_persist_conf(void) {
             }
         }
         if (retries <= 0) {
-            XLOG_W(TAG, "呼吸灯恢复: 发送消息失败, mqtt_custom_server可能未启动");
+            XLOG_W(TAG, "呼吸灯恢复: mqtt_custom_server未就绪, 将在主循环中延迟重试");
+            g_led_pending_value = g_persist_led;
+            g_led_retry_time = time(NULL) + 5;
         }
     }
 }
@@ -1295,6 +1345,7 @@ static int handle_post_service_toggle(int fd, const char *body, const char *quer
             XLOG_W(TAG, "呼吸灯: 发送控制消息失败");
         }
         g_persist_led = enable;
+        g_led_pending_value = -1;
         save_persist_conf();
         XLOG_I(TAG, "呼吸灯: %s", enable ? "enabled" : "disabled");
     } else if (strcmp(service, "key_backlight") == 0) {
@@ -1341,9 +1392,9 @@ static int handle_post_service_toggle(int fd, const char *body, const char *quer
         strncpy(g_persist_custom_ws_url, url, sizeof(g_persist_custom_ws_url) - 1);
         save_persist_conf();
         XLOG_I(TAG, "自定义WS URL: %s", url);
-        if (url[0]) {
+        {
             char esc_url[1024] = "";
-            json_escape(url, esc_url, sizeof(esc_url));
+            if (url[0]) json_escape(url, esc_url, sizeof(esc_url));
             char cmd[1200];
             snprintf(cmd, sizeof(cmd), "{\"cmd\":\"set_config\",\"ws_url\":\"%s\"}", esc_url);
             send_sair_cmd(cmd, strlen(cmd));
@@ -1416,10 +1467,7 @@ static int handle_get_diag(int fd, const char *body, const char *query) {
     }
 
     {
-        char pbuf[16] = "";
-        FILE *pf = popen("pidof launcher 2>/dev/null", "r");
-        if (pf) { fgets(pbuf, sizeof(pbuf), pf); pclose(pf); }
-        int launcher_running = (pbuf[0] != '\0');
+        int launcher_running = (find_pid_by_name("launcher") > 0);
         pos = diag_append(buf, pos, sizeof(buf), first,
             "Launcher进程", launcher_running,
             launcher_running ? "Launcher运行中" : "Launcher未运行",
@@ -1444,10 +1492,7 @@ static int handle_get_assistant_env(int fd, const char *body, const char *query)
     APPEND_PRINTF(buf, pos, (int)sizeof(buf), "{\"section\":\"assistant_env\",\"items\":[");
 
     {
-        char pbuf[16] = "";
-        FILE *pf = popen("pidof manager 2>/dev/null", "r");
-        if (pf) { fgets(pbuf, sizeof(pbuf), pf); pclose(pf); }
-        int mgr_running = (pbuf[0] != '\0');
+        int mgr_running = (find_pid_by_name("manager") > 0);
         pos = diag_append(buf, pos, sizeof(buf), first,
             "Manager进程", mgr_running,
             mgr_running ? "Manager运行中" : "Manager未运行",
@@ -1456,10 +1501,7 @@ static int handle_get_assistant_env(int fd, const char *body, const char *query)
     first = 0;
 
     {
-        char pbuf[16] = "";
-        FILE *pf = popen("pidof audio_service 2>/dev/null", "r");
-        if (pf) { fgets(pbuf, sizeof(pbuf), pf); pclose(pf); }
-        int audio_running = (pbuf[0] != '\0');
+        int audio_running = (find_pid_by_name("audio_service") > 0);
         pos = diag_append(buf, pos, sizeof(buf), first,
             "audio_service进程", audio_running,
             audio_running ? "音频服务运行中" : "音频服务未运行",
@@ -1874,37 +1916,21 @@ static int handle_get_assistant_status(int fd, const char *body, const char *que
     char log_level[16] = "";
 
     {
-        FILE *pf = popen("pidof sair 2>/dev/null", "r");
-        if (pf) {
-            char pbuf[16];
-            if (fgets(pbuf, sizeof(pbuf), pf)) {
-                pid = atoi(pbuf);
-                char exe_path[256] = "";
-                char cmd[128];
-                snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/exe 2>/dev/null", pid);
-                FILE *ef = popen(cmd, "r");
-                if (ef) {
-                    char ebuf[256];
-                    if (fgets(ebuf, sizeof(ebuf), ef)) {
-                        char *arrow = strstr(ebuf, "->");
-                        if (arrow) {
-                            snprintf(exe_path, sizeof(exe_path), "%s", arrow + 2);
-                            char *nl = strchr(exe_path, '\n');
-                            if (nl) *nl = '\0';
-                            while (*exe_path == ' ') memmove(exe_path, exe_path + 1, strlen(exe_path));
-                        }
-                    }
-                    pclose(ef);
-                }
-                if (strstr(exe_path, XWEBD_SAIR_BIN)) {
-                    running = 1;
-                } else if (strstr(exe_path, "/usr/bin/sair")) {
-                    native_running = 1;
-                } else if (exe_path[0]) {
-                    running = installed;
-                }
+        pid = find_pid_by_name("sair_main");
+        if (pid <= 0) pid = find_pid_by_name("sair");
+        if (pid > 0) {
+            char exe_path[256] = "";
+            char link_path[64];
+            snprintf(link_path, sizeof(link_path), "/proc/%d/exe", pid);
+            ssize_t elen = readlink(link_path, exe_path, sizeof(exe_path) - 1);
+            if (elen > 0) exe_path[elen] = '\0';
+            if (strstr(exe_path, XWEBD_SAIR_BIN)) {
+                running = 1;
+            } else if (strstr(exe_path, "/usr/bin/sair")) {
+                native_running = 1;
+            } else if (exe_path[0]) {
+                running = installed;
             }
-            pclose(pf);
         }
     }
 
@@ -2062,15 +2088,7 @@ static int handle_post_assistant_update(int fd, const char *body, const char *qu
 }
 
 static int handle_post_assistant_uninstall(int fd, const char *body, const char *query) {
-    int sair_running = 0;
-    {
-        char pbuf[16];
-        FILE *pf = popen("pidof sair 2>/dev/null", "r");
-        if (pf) {
-            if (fgets(pbuf, sizeof(pbuf), pf)) sair_running = 1;
-            pclose(pf);
-        }
-    }
+    int sair_running = (find_pid_by_name("sair_main") > 0 || find_pid_by_name("sair") > 0);
 
     int sair_exists = (access(XWEBD_SAIR_BIN, F_OK) == 0);
     if (!sair_running && !sair_exists)
@@ -2169,36 +2187,17 @@ static int handle_post_assistant_upgrade(int fd, const char *body, const char *q
             want_hot = 0;
     }
 
-    int sair_running = 0;
     int sair_custom = 0;
-    pid_t sair_pid = 0;
-    {
-        char pbuf[16];
-        FILE *pf = popen("pidof sair 2>/dev/null", "r");
-        if (pf) {
-            if (fgets(pbuf, sizeof(pbuf), pf)) { sair_running = 1; sair_pid = atoi(pbuf); }
-            pclose(pf);
-        }
-    }
+    pid_t sair_pid = find_pid_by_name("sair_main");
+    if (sair_pid <= 0) sair_pid = find_pid_by_name("sair");
+    int sair_running = (sair_pid > 0);
 
-    if (sair_running && sair_pid > 0) {
+    if (sair_running) {
         char exe_path[256] = "";
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/exe 2>/dev/null", sair_pid);
-        FILE *ef = popen(cmd, "r");
-        if (ef) {
-            char ebuf[256];
-            if (fgets(ebuf, sizeof(ebuf), ef)) {
-                char *arrow = strstr(ebuf, "->");
-                if (arrow) {
-                    snprintf(exe_path, sizeof(exe_path), "%s", arrow + 2);
-                    char *nl = strchr(exe_path, '\n');
-                    if (nl) *nl = '\0';
-                    while (*exe_path == ' ') memmove(exe_path, exe_path + 1, strlen(exe_path));
-                }
-            }
-            pclose(ef);
-        }
+        char link[64];
+        snprintf(link, sizeof(link), "/proc/%d/exe", sair_pid);
+        int n = readlink(link, exe_path, sizeof(exe_path) - 1);
+        if (n > 0) exe_path[n] = '\0';
         sair_custom = (strstr(exe_path, XWEBD_SAIR_BIN) != NULL);
     }
 
@@ -2244,14 +2243,9 @@ static int send_sair_cmd(const char *cmd_json, int cmd_len) {
 }
 
 static int signal_sair(const char *sig_name) {
-    char pbuf[16];
-    FILE *pf = popen("pidof sair 2>/dev/null", "r");
-    if (!pf) return -1;
-    int found = 0;
-    pid_t sair_pid = 0;
-    if (fgets(pbuf, sizeof(pbuf), pf)) { found = 1; sair_pid = atoi(pbuf); }
-    pclose(pf);
-    if (!found || sair_pid <= 0) return -2;
+    pid_t sair_pid = find_pid_by_name("sair_main");
+    if (sair_pid <= 0) sair_pid = find_pid_by_name("sair");
+    if (sair_pid <= 0) return -2;
     kill(sair_pid, SIGUSR1);
     XLOG_I(TAG, "%s: SIGUSR1 -> pid %d", sig_name, sair_pid);
     return 0;
@@ -2311,30 +2305,43 @@ static int handle_put_assistant_config(int fd, const char *body, const char *que
     if (body_len < 2 || body[0] != '{' || body[body_len - 1] != '}')
         return send_error(fd, 400, "Invalid JSON body");
 
-    char pbuf[16];
-    FILE *pf = popen("pidof sair 2>/dev/null", "r");
-    if (!pf) return send_error(fd, 500, "Cannot check sair process");
-    int found = 0;
-    if (fgets(pbuf, sizeof(pbuf), pf)) found = 1;
-    pclose(pf);
-
-    if (!found) return send_error(fd, 404, "sair not running");
-
-    char cmd_json[2048];
+    char cmd_json[4096];
     int inner_len = body_len - 2;
     int cmd_len = snprintf(cmd_json, sizeof(cmd_json),
         "{\"cmd\":\"set_config\",%.*s}", inner_len, body + 1);
     if (cmd_len >= (int)sizeof(cmd_json))
         return send_error(fd, 400, "Config too large");
 
+    {
+        int tmode = -1;
+        if (parse_json_int(body, "transport_mode", &tmode) == 0 && tmode >= 0 && tmode <= 1) {
+            g_persist_transport_mode = tmode;
+            save_persist_conf();
+            XLOG_I(TAG, "传输模式(随助手配置): %s", tmode == 1 ? "MQTT+UDP" : "WebSocket");
+        }
+    }
+    {
+        char ws_url[512] = {0};
+        if (parse_json_str(body, "custom_ws_url", ws_url, sizeof(ws_url)) == 0) {
+            strncpy(g_persist_custom_ws_url, ws_url, sizeof(g_persist_custom_ws_url) - 1);
+            save_persist_conf();
+            XLOG_I(TAG, "自定义WS URL(随助手配置): %s", ws_url);
+        }
+    }
+
+    pid_t sair_pid = find_pid_by_name("sair_main");
+    if (sair_pid <= 0) sair_pid = find_pid_by_name("sair");
+
+    if (sair_pid <= 0) {
+        XLOG_W(TAG, "配置变更: sair未运行，仅保存xwebd持久化配置");
+        return send_error(fd, 404, "sair not running");
+    }
+
     if (send_sair_cmd(cmd_json, cmd_len) != 0)
         return send_error(fd, 502, "Failed to write config command");
 
-    char spbuf[16];
-    FILE *spf = popen("pidof sair 2>/dev/null", "r");
-    pid_t sair_pid = 0;
-    if (spf) { if (fgets(spbuf, sizeof(spbuf), spf)) sair_pid = atoi(spbuf); pclose(spf); }
-    if (sair_pid > 0) kill(sair_pid, SIGUSR1);
+    kill(sair_pid, SIGUSR1);
+    XLOG_I(TAG, "配置变更: SIGUSR1 -> pid %d", sair_pid);
 
     return send_json(fd, 200, "{\"ok\":true}");
 }
@@ -2343,31 +2350,29 @@ static int handle_get_assistant_diag(int fd, const char *body, const char *query
     if (access(XWEBD_SAIR_BIN, F_OK) != 0)
         return send_json(fd, 200, "{\"ok_count\":0,\"fail_count\":1,\"total\":1,\"summary\":\"助手未安装\",\"items\":[{\"name\":\"助手状态\",\"ok\":false,\"message\":\"助手未安装\"}]}");
 
-    char pbuf[16];
-    FILE *pf = popen("pidof sair 2>/dev/null", "r");
-    if (!pf) return send_error(fd, 500, "Cannot check sair process");
-    int found = 0;
-    pid_t sair_pid = 0;
-    if (fgets(pbuf, sizeof(pbuf), pf)) { found = 1; sair_pid = atoi(pbuf); }
-    pclose(pf);
+    pid_t sair_pid = find_pid_by_name("sair_main");
+    if (sair_pid <= 0) sair_pid = find_pid_by_name("sair");
+    if (sair_pid <= 0) return send_json(fd, 200, "{\"ok_count\":0,\"fail_count\":1,\"total\":1,\"summary\":\"助手未运行\",\"items\":[{\"name\":\"助手状态\",\"ok\":false,\"message\":\"助手未运行\"}]}");
 
-    if (!found) return send_json(fd, 200, "{\"ok_count\":0,\"fail_count\":1,\"total\":1,\"summary\":\"助手未运行\",\"items\":[{\"name\":\"助手状态\",\"ok\":false,\"message\":\"助手未运行\"}]}");
+    unlink("/tmp/sair_diag.json");
 
     int req_fd = open("/tmp/sair_diag_request", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (req_fd >= 0) close(req_fd);
 
     if (sair_pid > 0) kill(sair_pid, SIGUSR1);
 
-    usleep(200000);
-
-    char buf[4096] = "";
-    int dfd = open("/tmp/sair_diag.json", O_RDONLY);
-    if (dfd >= 0) {
-        int n = read(dfd, buf, sizeof(buf) - 1);
-        close(dfd);
-        if (n > 0) {
-            buf[n] = '\0';
-            return send_json(fd, 200, buf);
+    for (int retry = 0; retry < 10; retry++) {
+        usleep(100000);
+        int dfd = open("/tmp/sair_diag.json", O_RDONLY);
+        if (dfd >= 0) {
+            char buf[4096] = "";
+            int n = read(dfd, buf, sizeof(buf) - 1);
+            close(dfd);
+            if (n > 0) {
+                unlink("/tmp/sair_diag.json");
+                buf[n] = '\0';
+                return send_json(fd, 200, buf);
+            }
         }
     }
     return send_json(fd, 200, "{\"ok_count\":0,\"fail_count\":1,\"total\":1,\"summary\":\"诊断信息不可用\",\"items\":[{\"name\":\"诊断\",\"ok\":false,\"message\":\"无法读取诊断信息\"}]}");
@@ -2859,6 +2864,7 @@ static void worker_loop(void) {
     xlog_init(NULL);
     XLOG_I(TAG, "xwebd工作进程已启动 (v%s, 端口 %d)", XWEBD_VERSION, g_port);
 
+    cpu_sample_update();
     cleanup_startup_residuals();
     load_persist_conf();
     apply_persist_conf();
@@ -2895,6 +2901,15 @@ static void worker_loop(void) {
 
     while (g_running) {
         while (waitpid(-1, NULL, WNOHANG) > 0) {}
+
+        if (g_led_pending_value >= 0 && time(NULL) >= g_led_retry_time) {
+            if (send_led_cmd(g_led_pending_value) == 0) {
+                XLOG_I(TAG, "呼吸灯延迟恢复: 成功 enable=%d", g_led_pending_value);
+                g_led_pending_value = -1;
+            } else {
+                g_led_retry_time = time(NULL) + 10;
+            }
+        }
 
         struct pollfd pfd = {g_server_fd, POLLIN, 0};
         int pret = poll(&pfd, 1, 1000);
