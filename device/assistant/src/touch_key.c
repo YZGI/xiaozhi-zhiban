@@ -15,12 +15,27 @@
 #include <string.h>
 #include <signal.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/prctl.h>
 #include <linux/input.h>
 
 #ifndef PR_SET_NAME
 #define PR_SET_NAME 15
 #endif
+
+/* 部分 uClibc 头文件未暴露以下触摸/坐标事件常量，手动补齐（与内核一致） */
+#ifndef BTN_TOUCH
+#define BTN_TOUCH 0x14a   /* 330: 手指按下/抬起 */
+#endif
+#ifndef ABS_X
+#define ABS_X 0x00
+#endif
+#ifndef ABS_Y
+#define ABS_Y 0x01
+#endif
+
+/* 软键(HOME/BACK)与 BTN_TOUCH 去抖窗口(ms)：软键区点击常同时上报两者，避免重复触发 */
+#define TOUCH_KEY_DEBOUNCE_MS 200
 
 /**
  * @brief 触摸按键监听线程函数
@@ -77,6 +92,15 @@ static void *touchkey_thread_func(void *arg)
         if (n != sizeof(ev))
             continue;
 
+        /* 记录绝对坐标（屏幕点击的 X/Y），供 BTN_TOUCH 回调上报 */
+        if (ev.type == EV_ABS)
+        {
+            if (ev.code == ABS_X)
+                tk->last_abs_x = ev.value;
+            else if (ev.code == ABS_Y)
+                tk->last_abs_y = ev.value;
+        }
+
         /* 过滤按键按下事件（value=1表示按下） */
         if (ev.type == EV_KEY && ev.value == 1)
         {
@@ -84,10 +108,28 @@ static void *touchkey_thread_func(void *arg)
             {
                 PLOG_I("KEY", "按键按下: code=%d", ev.code);
                 tk->pending_key = ev.code;
+                /* 记录软键时间戳，供 BTN_TOUCH 去抖 */
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                tk->last_key_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
                 /* 触发上层按键回调 */
                 if (tk->on_key)
                 {
                     tk->on_key(ev.code, tk->user_data);
+                }
+            }
+            else if (ev.code == BTN_TOUCH)
+            {
+                /* 真实屏幕点击：手指落下。设备原生 app 也是这么拿触摸的。
+                 * 与最近一次软键做去抖，避免软键区点击重复触发看电视/关电视。 */
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+                if (tk->on_touch && (now_ms - tk->last_key_ms) >= TOUCH_KEY_DEBOUNCE_MS)
+                {
+                    PLOG_I("KEY", "屏幕点击: BTN_TOUCH x=%d y=%d",
+                           tk->last_abs_x, tk->last_abs_y);
+                    tk->on_touch(tk->last_abs_x, tk->last_abs_y, tk->user_data);
                 }
             }
         }

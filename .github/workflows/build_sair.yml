@@ -54,6 +54,12 @@ jobs:
             && echo "✅ media_navi_open (设备原厂媒体链路)" || echo "⚠️ media_navi_open not found"
           grep -q "TV_PLAY_WAKEUP_INDEX" device/assistant/include/xiaozhi_config.h \
             && echo "✅ TV 离线命令词索引常量就位" || echo "⚠️ TV index const not found"
+          grep -q "TV_TOUCH_ENABLED" device/assistant/include/xiaozhi_config.h \
+            && echo "✅ TV 触摸触发开关就位" || echo "⚠️ TV touch flag not found"
+          grep -q "process_pending_touch" device/assistant/src/main.c \
+            && echo "✅ 触摸点击→看电视 主循环处理就位" || echo "⚠️ touch handler not found"
+          grep -q "BTN_TOUCH" device/assistant/src/touch_key.c \
+            && echo "✅ touch_key 捕获屏幕点击(BTN_TOUCH)" || echo "⚠️ BTN_TOUCH not found"
 
       - name: Upload sair artifact
         uses: actions/upload-artifact@v4

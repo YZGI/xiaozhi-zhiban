@@ -62,6 +62,9 @@ typedef struct app_context_t {
     int wakeup_cooldown_done;
     volatile int pending_key_exit;
     volatile int pending_key_home;
+    volatile int pending_touch_tap;
+    volatile int pending_touch_x;
+    volatile int pending_touch_y;
     volatile int pending_wakeup;
     volatile int pending_wakeup_type;
     volatile int pending_cleaning_done;

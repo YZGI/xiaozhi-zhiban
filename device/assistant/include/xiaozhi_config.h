@@ -108,6 +108,15 @@
 #define TV_STOP_WAKEUP_INDEX 17
 #endif
 
+/* 触摸点击触发「看电视/关电视」(GS705B Goodix 触摸屏, 同设备原厂 app 的输入机制)。
+ * 复用 touch_key 模块读取 /dev/input/event2（设备原生 app 也是这么拿触摸的）。
+ * 语义：单次点击屏幕 = 切换（未在播->看电视；在播->关电视），绕过云端对话。
+ * 坐标会打印到日志(pending_touch_x/y)，后续若想改成"左半屏看/右半屏关"分区，
+ * 在 process_pending_touch 里按坐标判断即可。改成 0 可彻底关闭触摸触发。 */
+#ifndef TV_TOUCH_ENABLED
+#define TV_TOUCH_ENABLED 1
+#endif
+
 #define WIFI_STATE_CONNECTED 5
 #define WIFI_INFO_SIZE       116
 

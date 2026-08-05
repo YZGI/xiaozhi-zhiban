@@ -702,6 +702,22 @@ static void on_key_event(int key_code, void *user_data)
 }
 
 /**
+ * @brief 屏幕点击回调（来自 touch_key 模块的 BTN_TOUCH 事件）
+ *        仅记录挂起标志与坐标，真正动作推迟到主循环 process_pending_touch 执行。
+ * @param x 触摸 X 坐标（ABS_X 原始值，单位依驱动）
+ * @param y 触摸 Y 坐标
+ * @param user_data app_context_t 指针
+ */
+static void on_touch_event(int x, int y, void *user_data)
+{
+    app_context_t *app = (app_context_t *)user_data;
+    app->pending_touch_tap = 1;
+    app->pending_touch_x = x;
+    app->pending_touch_y = y;
+    kill(getpid(), SIGUSR1);
+}
+
+/**
  * @brief 录音线程函数
  *        打开音频录音器（16kHz, 2麦克风+1参考信号），持续读取PCM数据
  *        并通过audio_dispatcher分发到唤醒模块和录音发送模块
@@ -2039,6 +2055,50 @@ static void process_pending_wakeup(app_context_t *app)
 }
 
 /**
+ * @brief 处理挂起的屏幕点击（看电视/关电视，触摸触发）
+ *        单次点击 = 切换：未在播 -> 看电视；在播 -> 关电视。
+ *        绕过云端对话，同离线命令词路径，复用设备原厂媒体链路。
+ *        与语音唤醒相互独立，作为额外触发入口（小智无 App 场景下更顺手）。
+ */
+static void process_pending_touch(app_context_t *app)
+{
+    if (!app->pending_touch_tap)
+        return;
+    app->pending_touch_tap = 0;
+
+    if (!TV_TOUCH_ENABLED)
+        return;
+    if (!app->mcp_initialized)
+        return;
+
+    if (mcp_tv_is_playing())
+    {
+        PLOG_I("TOUCH", "屏幕点击命中[关电视] (x=%d y=%d)，本地停止（不走云端）",
+               app->pending_touch_x, app->pending_touch_y);
+        mcp_stop_tv(&app->mcp);
+    }
+    else
+    {
+        /* 若正在播报 AI 语音，先打断，让电视原声干净接管（同唤醒打断逻辑） */
+        xiaozhi_state_t st = state_machine_get_state(&app->sm);
+        if (st == kStateSpeaking)
+        {
+            app->ignore_tts_audio = 1;
+            app->player.aborted = true;
+            audio_player_stop(&app->player);
+            if (protocol_handler_is_connected(&app->proto))
+            {
+                protocol_handler_send_abort(&app->proto, "tv_touch");
+                protocol_handler_clear_send_queue(&app->proto);
+            }
+        }
+        PLOG_I("TOUCH", "屏幕点击命中[看电视] (x=%d y=%d)，本地播放（不走云端）",
+               app->pending_touch_x, app->pending_touch_y);
+        mcp_play_tv(&app->mcp, NULL);
+    }
+}
+
+/**
  * @brief 处理挂起的返回键退出事件
  *        在Speaking/Listening/Connecting状态下终止当前会话
  * @param app 应用上下文指针
@@ -2620,6 +2680,8 @@ int main(int argc, char *argv[])
     /* 初始化触摸按键模块 */
     ret = touch_key_init(&app->touch_key, on_key_event, app);
     PLOG_I("INIT", "touch_key_init 返回值=%d", ret);
+    /* 注册真实屏幕点击(BTN_TOUCH)回调：触摸点击触发看电视/关电视 */
+    app->touch_key.on_touch = on_touch_event;
     heap_check("post-touch");
 
     /* 初始化MCP设备控制模块 */
@@ -2755,6 +2817,7 @@ int main(int argc, char *argv[])
         process_pending_wakeup(app);
         process_pending_key(app, &app->pending_key_exit, "BACK键退出", "user_key_exit");
         process_pending_key(app, &app->pending_key_home, "HOME键", "user_key_home");
+        process_pending_touch(app);
 
         /* 处理API中止请求 */
         if (app->pending_api_abort)
