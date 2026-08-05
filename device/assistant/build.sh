@@ -5,7 +5,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 BUILD_DIR="$PROJECT_DIR/build"
 
-SDK_PATH="${SDK_PATH:-$PROJECT_DIR/../../toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot}"
+# 工具链位置自适应：CI 把 tc.tar.xz 解压到 device/toolchain/，但历史上也出现在
+# 仓库根的 toolchain/。自动探测，避免 SDK_PATH 写死导致 gcc 找不到(exit 127)。
+if [ -z "$SDK_PATH" ]; then
+    for cand in \
+        "$PROJECT_DIR/../toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot" \
+        "$PROJECT_DIR/../../toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot" ; do
+        if [ -d "$cand/bin" ]; then
+            SDK_PATH="$cand"
+            break
+        fi
+    done
+    if [ -z "$SDK_PATH" ]; then
+        SDK_PATH="$PROJECT_DIR/../toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot"
+    fi
+fi
 CC=${CC:-arm-buildroot-linux-uclibcgnueabi-gcc}
 
 export PATH="$SDK_PATH/bin:$PATH"
