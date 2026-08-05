@@ -57,6 +57,7 @@
 #include "mcp_handler.h"
 #include "api_server.h"
 #include "app_context.h"
+#include "tv_web.h"
 
 /* 解决某些工具链缺少 __nan 链接符号的问题 */
 int __isnan(double x) { return x != x; }
@@ -2691,6 +2692,12 @@ int main(int argc, char *argv[])
         app->mcp_initialized = 1;
         mcp_handler_set_send_cb(&app->mcp, mcp_send_handler, app);
         PLOG_I("INIT", "mcp_handler_init 成功");
+        /* 启动看电视本地网页按钮（http://0.0.0.0:8082/，固件只读下最像
+           「点桌面图标」的触发方式；触摸点击/离线命令词仍并行可用） */
+        if (tv_web_start() == 0)
+            PLOG_I("INIT", "tv_web 已启动");
+        else
+            PLOG_W("INIT", "tv_web 启动失败（看电视网页按钮不可用）");
     }
     else
     {

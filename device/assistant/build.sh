@@ -109,6 +109,9 @@ $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/audio_precache.c" -o "$BUILD_DIR/audio_p
 echo "[17/20] Compiling mcp_handler.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/mcp_handler.c" -o "$BUILD_DIR/mcp_handler.o"
 
+echo "[17c/20] Compiling tv_web.o"
+$CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/tv_web.c" -o "$BUILD_DIR/tv_web.o"
+
 echo "[18/20] Compiling api_server.o"
 $CC $COMMON_CFLAGS -c "$PROJECT_DIR/src/api_server.c" -o "$BUILD_DIR/api_server.o"
 
@@ -140,6 +143,7 @@ $CC --sysroot=$SYSROOT \
     $BUILD_DIR/audio_recorder.o \
     $BUILD_DIR/audio_precache.o \
     $BUILD_DIR/mcp_handler.o \
+    $BUILD_DIR/tv_web.o \
     $BUILD_DIR/api_server.o \
     $BUILD_DIR/diag_module.o \
     -L$STUB_DIR \

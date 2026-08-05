@@ -1,6 +1,11 @@
-# 看电视 v11 —— 离线命令词方案（无需 App / 绕过云端）
+# 看电视 v13 —— 本地网页按钮触发（固件只读下的可用方案）
 
-> 适用：GS705B（智伴 1X）。让设备**本地语音**“看电视 / 关电视”直接出画面，不依赖小智 App、不依赖云端 AI 把话映射成工具调用。
+> 适用：GS705B（智伴 1X）。让设备**本地**“看电视 / 关电视”直接出画面，不依赖小智 App、不依赖云端 AI 把话映射成工具调用。
+
+> 🔴 **重要前提：GS705B 根文件系统是只读 squashfs（`/dev/nand0p4 / squashfs ro`），无法改写。**
+> - ❌ `def_config.bin`（离线命令词）、`/usr/local/resource/*.desktop`（桌面图标）**都在只读固件上，设备上写不进去** —— 故「离线命令词」与「新增桌面图标」两条路在本机**均不可部署**。
+> - ✅ 能 100% 掌控且热部署的只有 `sair` / 其内的逻辑（在可写 `/var/upgrade`）。因此本版本的「触发」落地为 **sair 内起的本地网页按钮**：浏览器/同局域网手机打开点按钮即触发，最贴近“点桌面图标”的体验，且零固件改动。
+> - 三种触发方式中：**离线命令词（方式一）、触摸点击（方式二）在当前只读固件下均不实际可用**；**本地网页按钮（方式三，v13）是唯一已验证可部署的触发入口 ✅**。
 
 ---
 
@@ -28,6 +33,14 @@
 - 单次点击屏幕 = **切换**：未在播 → `mcp_play_tv`（看电视）；在播 → `mcp_stop_tv`（关电视）。同样绕过云端对话、复用原厂媒体链路。
 - 与软键区做了 200ms 去抖，避免软键点击被误判成“看电视”双击。坐标会打印到日志（`pending_touch_x/y`），后续想改成“左半屏看 / 右半屏关”分区，在 `process_pending_touch` 里按坐标判断即可。
 - 开关：`xiaozhi_config.h` 的 `TV_TOUCH_ENABLED`（默认 1，改 0 彻底关闭触摸触发）。
+- ⚠️ 该 Goodix 固件**实测只对主屏报 HOME/BACK 软键、不上报 `BTN_TOUCH`**，故方式二在 GS705B 上当前**点屏无效**（日志无 `屏幕点击: BTN_TOUCH`）。保留代码，待换支持主屏 BTN_TOUCH 的固件再用。
+
+**触发方式三：本地网页按钮（v13 新增，当前唯一可用 ✅）**
+- 固件只读、桌面图标加不了，但 `sair` 在可写 `/var/upgrade`，可热部署。我们在 `sair` 内起一个**轻量 HTTP 服务**（默认 `:8082`），页面上两个大按钮「▶ 看电视 / ■ 关电视」，点一下即触发。
+- 浏览器或同局域网手机/电脑打开 `http://<设备IP>:8082/`，点按钮 → `sair` 内部走 `mcp_play_tv` / `mcp_stop_tv`（原厂 `media_navi` / `splayer` 硬件解码），与方式一/二共用同一套播放实现。
+- 线程安全：`mcp_play_tv` / `mcp_stop_tv` / `mcp_tv_is_playing` 加递归互斥锁（网页线程与主循环可能并发调用）。
+- 端口可用环境变量 `TV_WEB_PORT` 覆盖；服务启动日志：`看电视网页按钮已启动: http://0.0.0.0:8082/`。
+- 这是当前只读固件下**最像“点系统桌面图标”且完全可控**的触发方式，无需 App、无需云端、无需改固件。
 
 ---
 
@@ -42,6 +55,11 @@
 | `include/app_context.h` | 新增 `pending_touch_tap / pending_touch_x / pending_touch_y` 挂起标志 |
 | `src/main.c` | `on_touch_event` 回调 + `process_pending_touch`（点击切换看电视/关电视，绕过云端，播报中点击先打断 AI）；主循环调用；`process_pending_wakeup` 顶部拦截电视命令（绕过云端）；TTS 播放时若电视在播则**抑制 AI 播报** |
 | `tools/patch_def_config_bin.py` | `def_config.bin` 安全补丁工具（dry-run + 空闲区检查 + 备份） |
+| `include/tv_web.h` / `src/tv_web.c` | **v13 本地网页按钮**：`sair` 内轻量 HTTP 服务（`:8082`），路由 `/tv/play` `/tv/stop` `/tv/status` `/`；点击调 `mcp_play_tv` / `mcp_stop_tv`，页面轮询状态 |
+| `src/mcp_handler.c` | 三个 TV 函数加**递归互斥锁**（`g_tv_mutex`），支持网页线程与主循环并发调用 |
+| `src/main.c` | `mcp_handler_init` 成功后 `tv_web_start()` 启动网页按钮；引入 `tv_web.h` |
+| `build.sh` | 新增 `tv_web.o` 编译与链接 |
+| `.github/workflows/build_sair.yml` | 校验步骤新增 `tv_web_start`（main.c）/ `tv_web_run`（tv_web.c） |
 
 ---
 
@@ -126,6 +144,17 @@ bash deploy_tv.sh <设备IP> /path/to/sair --cold   # 冷部署（替换二进�
     或把软键区当触发：在 `touch_key.c` 里把 HOME→看电视、BACK→关电视（需同步改 `on_key_event` 的导航语义，谨慎）。
 - 若点击**误触发频繁**（每次软键也带 BTN_TOUCH）：调大 `TOUCH_KEY_DEBOUNCE_MS`（默认 200）。
 - 想按区域分“看 / 关”：在 `process_pending_touch` 里用 `app->pending_touch_x` 结合屏幕宽做判断（先用日志看 `x` 的范围）。
+
+---
+
+## 七、网页按钮验证（v13，当前主用）
+
+- 部署新 `sair` 后，看启动日志确认服务拉起：
+  - `看电视网页按钮已启动: http://0.0.0.0:8082/`
+- 在**设备自带浏览器**或**同局域网手机/电脑**打开 `http://<设备IP>:8082/`（本机实测 IP `192.168.1.19`，即 `http://192.168.1.19:8082/`）。
+- 点「▶ 看电视」→ 设备应出画面，日志：`TVWEB 网页触发 看电视`；点「■ 关电视」→ 日志：`TVWEB 网页触发 关电视`。
+- 页面底部状态每 3 秒自动刷新（调用 `/tv/status`）。
+- 若打不开页面：telnet 进设备 `netstat -an | grep 8082` 确认监听；确认 `sair` 是最新已部署版本（`md5sum /var/upgrade/sair`）。
 
 ---
 

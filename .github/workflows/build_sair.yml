@@ -60,6 +60,12 @@ jobs:
             && echo "✅ 触摸点击→看电视 主循环处理就位" || echo "⚠️ touch handler not found"
           grep -q "BTN_TOUCH" device/assistant/src/touch_key.c \
             && echo "✅ touch_key 捕获屏幕点击(BTN_TOUCH)" || echo "⚠️ BTN_TOUCH not found"
+          grep -q "tv_web_start" device/assistant/src/main.c \
+            && echo "✅ 看电视网页按钮已挂载(tv_web_start)" || echo "⚠️ tv_web_start not found"
+          grep -q "tv_web_run" device/assistant/src/tv_web.c \
+            && echo "✅ 网页按钮 HTTP 线程就位(tv_web_run)" || echo "⚠️ tv_web_run not found"
+          test -f device/assistant/src/tv_web.c \
+            && echo "✅ tv_web.c 存在" || echo "⚠️ tv_web.c 缺失"
 
       - name: Upload sair artifact
         uses: actions/upload-artifact@v4

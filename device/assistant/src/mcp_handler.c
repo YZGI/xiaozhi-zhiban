@@ -24,6 +24,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <pthread.h>
+
+/* 看电视播放状态互斥锁：网页按钮线程(tv_web)与主循环(触摸/命令词)可能
+   并发调用 mcp_play_tv/mcp_stop_tv/mcp_tv_is_playing，用递归锁保护。
+   mcp_play_tv 内部会调用 mcp_stop_tv，故必须用 PTHREAD_MUTEX_RECURSIVE。 */
+static pthread_mutex_t g_tv_mutex;
 
 /* 默认电视源（公开 HLS 测试流，请改成你的频道 m3u8/rtsp 地址） */
 #ifndef TV_DEFAULT_URL
@@ -57,6 +63,15 @@ int mcp_handler_init(mcp_handler_t *mcp)
     if (!mcp)
         return -1;
     memset(mcp, 0, sizeof(*mcp));
+
+    /* 初始化看电视互斥锁（递归锁，mcp_play_tv 会内部调用 mcp_stop_tv） */
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&g_tv_mutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+    }
 
     /* 动态加载设备控制库 */
     mcp->lib_handle = dlopen("libmsg_server_api.so", RTLD_NOW);
@@ -145,12 +160,17 @@ void mcp_handler_destroy(mcp_handler_t *mcp)
 
 int mcp_tv_is_playing(void)
 {
-    return g_tv_playing;
+    int v;
+    pthread_mutex_lock(&g_tv_mutex);
+    v = g_tv_playing;
+    pthread_mutex_unlock(&g_tv_mutex);
+    return v;
 }
 
 int mcp_stop_tv(mcp_handler_t *mcp)
 {
     int ret = -1;
+    pthread_mutex_lock(&g_tv_mutex);
 #if TV_USE_MEDIA_NAVI
     if (mcp && mcp->media_navi_close)
     {
@@ -166,6 +186,7 @@ int mcp_stop_tv(mcp_handler_t *mcp)
         PLOG_I("TV", "停止播放 (splayer_stop 兜底)");
     }
     g_tv_playing = 0;
+    pthread_mutex_unlock(&g_tv_mutex);
     return ret;
 }
 
@@ -173,6 +194,7 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
 {
     if (!mcp)
         return -1;
+    pthread_mutex_lock(&g_tv_mutex);
     if (!url || url[0] == '\0')
         url = TV_DEFAULT_URL;
 
@@ -222,6 +244,7 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
     }
 
     g_tv_playing = (ok == 0) ? 1 : 0;
+    pthread_mutex_unlock(&g_tv_mutex);
     return ok;
 }
 
