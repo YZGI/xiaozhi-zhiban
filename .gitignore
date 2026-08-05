@@ -1,0 +1,25 @@
+build/
+__pycache__/
+*.o
+*.pyc
+*.log
+*.tar.bz2
+*.tar.xz
+toolchain/
+.DS_Store
+Thumbs.db
+.env
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+project_config.json
+version.h
+
+# 云编译（GitHub Actions）需要工具链，放行 device/toolchain/tc.tar.xz
+!device/toolchain/
+!device/toolchain/tc.tar.xz
+
+# 不提交本地编译产物（由 Actions 重新生成）
+prebuilt/

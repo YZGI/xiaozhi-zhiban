@@ -1,0 +1,81 @@
+name: Build sair (ARM uClibc, full inline v8)
+on:
+  workflow_dispatch:
+  push:
+    paths: ['device/**', '.github/**']
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract toolchain
+        shell: bash
+        run: |
+          set -x
+          sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils
+          ls -la device/toolchain/tc.tar.xz
+          cd device/toolchain && tar xJf tc.tar.xz
+          TC=$(pwd)/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot
+          echo "GCC=$TC/bin/arm-buildroot-linux-uclibcgnueabi-gcc" >> "$GITHUB_ENV"
+          echo "STRIP=$TC/bin/arm-buildroot-linux-uclibcgnueabi-strip" >> "$GITHUB_ENV"
+          echo "SYSROOT=$TC/arm-buildroot-linux-uclibcgnueabi/sysroot" >> "$GITHUB_ENV"
+          test -f "$TC/bin/arm-buildroot-linux-uclibcgnueabi-gcc" || { echo "NO GCC"; exit 1; }
+          echo "TOOLCHAIN OK"
+
+      - name: Compile
+        shell: bash
+        run: |
+          set -x
+          cd device/assistant
+          mkdir -p build build/stubs prebuilt
+          echo '#define XIAOZHI_VERSION "2.1.1"' > build/version.h
+          CFLAGS="-Wall -Os -g0 -mcpu=cortex-a5 -mfloat-abi=soft -no-pie --sysroot=${{ env.SYSROOT }} -Iinclude -Iinclude/reverse -Ilib/mbedtls/include -Ilib/cJSON -Ilib/opus/include -Ibuild -D_GNU_SOURCE -DFIXED_POINT=1"
+          for f in src/main.c src/state_machine.c src/watchdog.c src/config_manager.c src/plog.c src/wakeup_module.c src/audio_dispatcher.c src/touch_key.c src/tls_transport.c src/http_client.c src/websocket.c src/mqtt_client.c src/udp_audio.c src/protocol_handler.c src/audio_player.c src/audio_recorder.c src/audio_precache.c src/mcp_handler.c src/api_server.c src/diag_module.c; do
+            echo "Compiling $f"
+            ${{ env.GCC }} $CFLAGS -c "$f" -o "build/$(basename $f .c).o" || exit 1
+          done
+          echo "All objects:"
+          ls -la build/*.o
+
+      - name: Link
+        shell: bash
+        run: |
+          set -x
+          cd device/assistant
+          B=build S=build/stubs
+          # Unconditionally create ALL stub .so files (sysroot libs may be broken symlinks)
+          for lib in applib apconfig configpart audio_service_api audio_recorder dds; do
+            ${{ env.GCC }} -shared -Wl,-soname,lib${lib}.so -o "$S/lib${lib}.so" -mcpu=cortex-a5 -mfloat-abi=soft 2>/dev/null || true
+            echo "Stub: $S/lib${lib}.so ($(ls -la "$S/lib${lib}.so" 2>/dev/null | awk '{print $5}') bytes)"
+          done
+          # Link with stubs dir FIRST in library path
+          ${{ env.GCC }} --sysroot=${{ env.SYSROOT }} -mcpu=cortex-a5 -mfloat-abi=soft -no-pie -rdynamic \
+            -Wl,--no-as-needed,-rpath,'$ORIGIN/../lib_sf' \
+            $B/main.o $B/state_machine.o $B/watchdog.o $B/config_manager.o $B/plog.o $B/wakeup_module.o \
+            $B/audio_dispatcher.o $B/touch_key.o $B/tls_transport.o $B/http_client.o $B/websocket.o \
+            $B/mqtt_client.o $B/udp_audio.o $B/protocol_handler.o $B/audio_player.o $B/audio_recorder.o \
+            $B/audio_precache.o $B/mcp_handler.o $B/api_server.o $B/diag_module.o \
+            "-L$S" "-L$S" -Llib_sf -L"${{ env.SYSROOT }}/usr/lib" \
+            -lmbedtls -lmbedx509 -lmbedcrypto -lcjson -lopus -lpthread -lrt -ldl -lm \
+            -lapplib -lapconfig -lconfigpart -laudio_service_api -laudio_recorder -ldds \
+            -Wl,--unresolved-symbols=ignore-all -o $B/sair
+          echo "Linked: $(file $B/sair)"
+
+      - name: Strip & package
+        shell: bash
+        run: |
+          cd device/assistant
+          ${{ env.STRIP }} --strip-unneeded build/sair || true
+          cp build/sair prebuilt/sair
+          file prebuilt/sair
+
+      - name: Verify play_tv
+        shell: bash
+        run: grep -q "self.play_tv" device/assistant/src/mcp_handler.c && echo OK || echo MISSING
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sair
+          path: device/assistant/prebuilt/sair
+          if-no-files-found: error

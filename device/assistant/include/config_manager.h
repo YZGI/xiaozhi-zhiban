@@ -1,0 +1,37 @@
+#ifndef CONFIG_MANAGER_H
+#define CONFIG_MANAGER_H
+
+#include <stdint.h>
+
+typedef struct {
+    char wake_word[256];
+    char wake_thresh[64];
+    char device_mac[18];
+    char client_id[64];
+    char ws_url[512];
+    char ws_token[512];
+    char activation_code[64];
+    char mcp_endpoint[512];
+    char mqtt_host[128];
+    int mqtt_port;
+    char mqtt_client_id[256];
+    char mqtt_username[512];
+    char mqtt_password[512];
+    int mqtt_keepalive;
+    char mqtt_subscribe_topic[256];
+    char mqtt_publish_topic[256];
+    int has_mqtt_config;
+    int has_ws_config;
+    int needs_activation;
+    int ws_protocol_version;
+} config_manager_t;
+
+int config_manager_init(config_manager_t* cfg);
+void config_manager_destroy(config_manager_t* cfg);
+int config_manager_check_wifi(void);
+int config_manager_check_activation(config_manager_t* cfg);
+int config_manager_get_mac(char* buf, int buf_size);
+int config_manager_get_or_create_client_id(char* buf, int buf_size);
+int config_manager_reload(config_manager_t* cfg);
+
+#endif
