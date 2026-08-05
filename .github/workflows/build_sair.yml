@@ -7,6 +7,7 @@ on:
   push:
     paths:
       - 'device/**'
+      - '.github/**'
 
 jobs:
   build:
@@ -15,17 +16,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 关键修复：Windows 创建的 .sh 文件带 CRLF (\r\n)，Linux 上 shebang 变成 #!/bin/bash\r 导致 exit code 127
+      - name: Fix CRLF line endings (Windows -> Linux)
+        run: |
+          find . -name '*.sh' -exec sed -i 's/\r$//' {} +
+          echo "✅ CRLF fixed in all .sh files"
+
       - name: Install xz-utils & Extract ARM uClibc toolchain
         run: |
+          set -x
           which xz || (apt-get update && apt-get install -y xz-utils)
+          echo "=== Repository structure ==="
+          ls -la device/
+          echo "=== Check toolchain archive ==="
+          test -f device/toolchain/tc.tar.xz || { echo "❌ 缺少 device/toolchain/tc.tar.xz"; ls -laR device/toolchain/ 2>/dev/null || true; exit 1; }
+          echo "tc.tar.xz size: $(stat -c%s device/toolchain/tc.tar.xz) bytes"
           cd device/toolchain
-          test -f tc.tar.xz || { echo "❌ 缺少 device/toolchain/tc.tar.xz"; exit 1; }
           tar xJf tc.tar.xz
-          ls arm-buildroot-linux-uclibcgnueabi_sdk-buildroot/bin/arm-buildroot-linux-uclibcgnueabi-gcc
+          echo "=== Toolchain contents ==="
+          ls arm-buildroot-linux-uclibcgnueabi_sdk-buildroot/bin/arm-buildroot-linux-uclibcgnueabi-gcc || { echo "❌ 工具链解压后缺少 gcc"; exit 1; }
 
       - name: Build sair (includes self.play_tv)
         run: |
+          set -x
           cd device/assistant
+          # 确认脚本可执行且无 CRLF
+          head -1 build.sh | cat -v
           bash build.sh
 
       - name: Verify self.play_tv is present
@@ -38,3 +54,4 @@ jobs:
         with:
           name: sair
           path: device/assistant/prebuilt/sair
+          if-no-files-found: error
