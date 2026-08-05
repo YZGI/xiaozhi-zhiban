@@ -42,6 +42,9 @@
             PLOG_W("MCP", "符号未找到: %s", #name); \
     } while (0)
 
+/* 看电视播放状态（供 main.c 抑制 AI 播报，避免与原声冲突） */
+static int g_tv_playing = 0;
+
 /**
  * @brief 初始化MCP处理器
  * @param mcp MCP处理器实例指针
@@ -93,6 +96,21 @@ int mcp_handler_init(mcp_handler_t *mcp)
         PLOG_W("MCP", "加载 libsmart_player_api.so 失败: %s", dlerror());
     }
 
+    /* 加载设备原厂媒体导航库 (libmedia_navi_api.so，学习软件播视频同款，
+       走 olmedia_service 守护 + 缓冲 UI)。TV_USE_MEDIA_NAVI=1 时优先用于看电视。 */
+    mcp->navi_handle = dlopen("libmedia_navi_api.so", RTLD_NOW);
+    if (mcp->navi_handle)
+    {
+        LOAD_SYM(mcp->navi_handle, media_navi_open, int (*)(const char *));
+        LOAD_SYM(mcp->navi_handle, media_navi_close, int (*)(void));
+        PLOG_I("MCP", "已加载 libmedia_navi_api.so (media_navi_open=%s)",
+               mcp->media_navi_open ? "ok" : "缺失");
+    }
+    else
+    {
+        PLOG_W("MCP", "加载 libmedia_navi_api.so 失败: %s (看电视将走 splayer 兜底)", dlerror());
+    }
+
     PLOG_I("MCP", "初始化完成，已加载 libmsg_server_api.so");
     return 0;
 }
@@ -110,12 +128,101 @@ void mcp_handler_destroy(mcp_handler_t *mcp)
         dlclose(mcp->player_handle);
         mcp->player_handle = NULL;
     }
+    if (mcp->navi_handle)
+    {
+        dlclose(mcp->navi_handle);
+        mcp->navi_handle = NULL;
+    }
     if (mcp->lib_handle)
     {
         dlclose(mcp->lib_handle);
         mcp->lib_handle = NULL;
     }
     PLOG_I("MCP", "已销毁");
+}
+
+/* ===== 看电视：设备原厂媒体链路播放（离线命令词触发，绕过云端） ===== */
+
+int mcp_tv_is_playing(void)
+{
+    return g_tv_playing;
+}
+
+int mcp_stop_tv(mcp_handler_t *mcp)
+{
+    int ret = -1;
+#if TV_USE_MEDIA_NAVI
+    if (mcp && mcp->media_navi_close)
+    {
+        mcp->media_navi_close();
+        ret = 0;
+        PLOG_I("TV", "停止播放 (media_navi_close)");
+    }
+#endif
+    if (ret != 0 && mcp && mcp->splayer_stop)
+    {
+        mcp->splayer_stop();
+        ret = 0;
+        PLOG_I("TV", "停止播放 (splayer_stop 兜底)");
+    }
+    g_tv_playing = 0;
+    return ret;
+}
+
+int mcp_play_tv(mcp_handler_t *mcp, const char *url)
+{
+    if (!mcp)
+        return -1;
+    if (!url || url[0] == '\0')
+        url = TV_DEFAULT_URL;
+
+    /* 先停掉上一路，避免画面/音频叠加 */
+    mcp_stop_tv(mcp);
+
+    int ok = -1;
+#if TV_USE_MEDIA_NAVI
+    if (mcp->media_navi_open)
+    {
+        /* 设备原厂媒体导航：走 olmedia_service 守护 + 缓冲 UI（学习软件同款） */
+        int r = mcp->media_navi_open(url);
+        if (r == 0)
+        {
+            ok = 0;
+            PLOG_I("TV", "media_navi_open 成功: %s", url);
+        }
+        else
+        {
+            PLOG_W("TV", "media_navi_open 返回 %d，回退 splayer_*", r);
+        }
+    }
+    else
+    {
+        PLOG_W("TV", "media_navi_open 符号缺失，回退 splayer_*");
+    }
+#endif
+
+    if (ok != 0)
+    {
+        /* 兜底：直接使用工厂硬解库 libsmart_player_api.so 的 splayer_*。
+           注意：必须在 sair（框架主应用，含 applib 上下文）内调用，
+           裸命令行调用会因 applib_init 失败而无效。 */
+        if (!mcp->splayer_set_file || !mcp->splayer_play)
+        {
+            PLOG_E("TV", "播放失败：media_navi 与 splayer 均不可用");
+            return -1;
+        }
+        if (mcp->splayer_open)
+            mcp->splayer_open();
+        mcp->splayer_set_file(url);
+        if (mcp->splayer_set_volume)
+            mcp->splayer_set_volume(TV_DEFAULT_VOL);
+        mcp->splayer_play();
+        PLOG_I("TV", "splayer_* 播放: %s", url);
+        ok = 0;
+    }
+
+    g_tv_playing = (ok == 0) ? 1 : 0;
+    return ok;
 }
 
 /**
@@ -517,29 +624,16 @@ static int exec_tool(mcp_handler_t *mcp, const char *name, const char *args_json
         return 0;
     }
 
-    /* 看电视：播放指定网络 URL（复用工厂硬件解码 libsmart_player_api.so） */
+    /* 看电视：播放指定网络 URL（设备原厂媒体链路，绕过云端；
+       云端 MCP 工具 self.play_tv 也走这里，作为离线命令词之外的冗余触发） */
     if (strcmp(name, "self.play_tv") == 0)
     {
         char url[1024] = {0};
         find_string(args_json, args_len, "url", url, sizeof(url));
-        if (url[0] == '\0')
-            strncpy(url, TV_DEFAULT_URL, sizeof(url) - 1);
-
-        if (!mcp->splayer_set_file || !mcp->splayer_play)
-        {
-            snprintf(result, result_size, "player lib not loaded");
-            return -1;
-        }
-        if (mcp->splayer_stop)
-            mcp->splayer_stop();
-        if (mcp->splayer_open)
-            mcp->splayer_open();
-        mcp->splayer_set_file(url);
-        if (mcp->splayer_set_volume)
-            mcp->splayer_set_volume(TV_DEFAULT_VOL);
-        mcp->splayer_play();
-        snprintf(result, result_size, "playing %s", url);
-        return 0;
+        int r = mcp_play_tv(mcp, url[0] ? url : NULL);
+        snprintf(result, result_size, r == 0 ? "playing %s" : "play failed",
+                 url[0] ? url : TV_DEFAULT_URL);
+        return r;
     }
 
     snprintf(result, result_size, "unknown tool: %s", name);

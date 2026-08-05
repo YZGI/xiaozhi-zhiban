@@ -912,7 +912,15 @@ static void on_proto_json(const char *json, size_t len, void *user_data)
                 {
                     state_machine_transition(&app->sm, kStateSpeaking);
                 }
-                audio_player_start(&app->player);
+                if (mcp_tv_is_playing())
+                {
+                    /* 看电视播放中：抑制 AI 播报，避免与原声冲突（会话状态仍照常切换） */
+                    PLOG_I("PROTO", "看电视播放中，抑制 AI 播报避免与原声冲突");
+                }
+                else
+                {
+                    audio_player_start(&app->player);
+                }
             }
         }
         else if (strcmp(state_str, "stop") == 0)
@@ -1933,6 +1941,29 @@ static void process_pending_wakeup(app_context_t *app)
     if (!app->pending_wakeup)
         return;
     app->pending_wakeup = 0;
+
+    /* ===== 看电视：离线命令词直触发，绕过云端对话 =====
+     * kan dian shi(看电视)=TV_PLAY_WAKEUP_INDEX / guan dian shi(关电视)=TV_STOP_WAKEUP_INDEX
+     * 命中即本地播放/停止，不进入云端会话（小智无 App、云端对自定义命令不可靠）。 */
+    if (app->mcp_initialized)
+    {
+        if (app->pending_wakeup_type == TV_PLAY_WAKEUP_INDEX)
+        {
+            PLOG_I("TV", "命中离线命令词[看电视] type=%d，本地播放（不走云端）",
+                   app->pending_wakeup_type);
+            mcp_play_tv(&app->mcp, NULL);
+            app->last_wakeup_ms = get_time_ms();
+            return;
+        }
+        if (app->pending_wakeup_type == TV_STOP_WAKEUP_INDEX)
+        {
+            PLOG_I("TV", "命中离线命令词[关电视] type=%d，本地停止（不走云端）",
+                   app->pending_wakeup_type);
+            mcp_stop_tv(&app->mcp);
+            app->last_wakeup_ms = get_time_ms();
+            return;
+        }
+    }
 
     xiaozhi_state_t state = state_machine_get_state(&app->sm);
     PLOG_I("WAKEUP", "在 %s 状态处理唤醒, type=%d",

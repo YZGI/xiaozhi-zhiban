@@ -44,10 +44,16 @@ jobs:
           head -1 build.sh | cat -v
           bash build.sh
 
-      - name: Verify self.play_tv is present
+      - name: Verify TV (v11) symbols are present
         run: |
           grep -q "self.play_tv" device/assistant/src/mcp_handler.c \
             && echo "✅ self.play_tv wired" || echo "⚠️ play_tv not found"
+          grep -q "mcp_play_tv" device/assistant/src/mcp_handler.c \
+            && echo "✅ mcp_play_tv wired (离线命令词播放)" || echo "⚠️ mcp_play_tv not found"
+          grep -q "media_navi_open" device/assistant/src/mcp_handler.c \
+            && echo "✅ media_navi_open (设备原厂媒体链路)" || echo "⚠️ media_navi_open not found"
+          grep -q "TV_PLAY_WAKEUP_INDEX" device/assistant/include/xiaozhi_config.h \
+            && echo "✅ TV 离线命令词索引常量就位" || echo "⚠️ TV index const not found"
 
       - name: Upload sair artifact
         uses: actions/upload-artifact@v4

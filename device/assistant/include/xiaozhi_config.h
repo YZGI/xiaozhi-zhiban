@@ -77,6 +77,37 @@
 #define INJECT_KEY_VOLUP   115
 #define INJECT_KEY_VOLDOWN 114
 
+/* ===== 看电视（离线命令词，绕过云端对话） =====
+ * 走设备原厂媒体链路（学习软件播放视频同款），不依赖小智 App / 云端 AI。
+ * 触发：在 /etc/user/def_config.bin 的 LOCAL_COMMAND_WORD 末尾追加
+ *       kan dian shi(看电视) 与 guan dian shi(关电视) 两个拼音命令词，
+ *       引擎本地识别后 on_wakeup_event 收到对应索引，直调媒体播放。
+ */
+#ifndef TV_DEFAULT_URL
+/* 默认电视源（公开 HLS 测试流，请改成你的频道 m3u8/rtsp 地址，国内源更稳） */
+#define TV_DEFAULT_URL "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+#endif
+#ifndef TV_DEFAULT_VOL
+#define TV_DEFAULT_VOL 30
+#endif
+/* 优先使用设备原厂媒体导航库 libmedia_navi_api.so（media_navi_open，走 olmedia_service 守护 +
+ * 缓冲 UI，学习软件同款）。若实机播放异常（如该库未随固件放出），改成 0 强制走
+ * libsmart_player_api.so 的 splayer_* 兜底路径（已实证可从 sair 上下文调用）。 */
+#ifndef TV_USE_MEDIA_NAVI
+#define TV_USE_MEDIA_NAVI 1
+#endif
+/* 离线命令词在 LOCAL_COMMAND_WORD 中的索引（1-based，主唤醒词 zhi ban zhi ban 不计入）。
+ * 原厂 15 个命令词为 1..15（ting zhi bo fang 收尾=15），我们在末尾追加
+ *   kan dian shi(看电视)  -> 16
+ *   guan dian shi(关电视) -> 17
+ * 实机若不符：唤醒后看日志 "WAKEUP type=" 的值，据此修正下面两个常量即可（无需改索引逻辑）。 */
+#ifndef TV_PLAY_WAKEUP_INDEX
+#define TV_PLAY_WAKEUP_INDEX 16
+#endif
+#ifndef TV_STOP_WAKEUP_INDEX
+#define TV_STOP_WAKEUP_INDEX 17
+#endif
+
 #define WIFI_STATE_CONNECTED 5
 #define WIFI_INFO_SIZE       116
 
