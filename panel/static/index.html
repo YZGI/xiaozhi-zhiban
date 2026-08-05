@@ -27,6 +27,8 @@
     <span>设备控制面板</span>
   </div>
   <div class="nav-actions">
+    <select id="deviceSelect" class="nav-device-select" onchange="switchDevice()" title="切换设备"></select>
+    <button class="btn btn-ghost btn-sm" onclick="addDevice()" title="添加设备">+设备</button>
     <a href="https://github.com/moyu929/xiaozhi-zhiban" target="_blank" rel="noopener noreferrer" class="btn btn-ghost btn-sm" title="GitHub">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
     </a>
@@ -217,6 +219,29 @@
           </section>
         </div>
 
+        <section class="card" id="tvCard">
+          <div class="card-header"><h2>📺 看电视</h2>
+            <div class="card-actions">
+              <span id="tvStatusBadge" class="status-pill offline"><span class="status-dot offline"></span><span id="tvStatusText">未播放</span></span>
+              <button class="btn btn-primary btn-sm" onclick="tvPlay()" id="btnTvPlay">▶ 看电视</button>
+              <button class="btn btn-danger btn-sm" onclick="tvStop()" id="btnTvStop">■ 关电视</button>
+              <button class="btn btn-ghost btn-xs" onclick="tvRefresh()">刷新</button>
+            </div>
+          </div>
+          <div class="tv-channels">
+            <div class="form-label-row"><label class="form-label">频道列表</label>
+              <span style="display:flex;gap:6px">
+                <button class="btn btn-accent btn-xs" onclick="tvChannelAdd()">+ 频道</button>
+                <button class="btn btn-ghost btn-xs" onclick="tvSyncToDevice()">同步到设备</button>
+                <button class="btn btn-ghost btn-xs" onclick="tvLoadFromDevice()">从设备读取</button>
+              </span>
+            </div>
+            <div id="tvChannelsList" class="tv-ch-list"></div>
+          </div>
+          <div style="margin:8px 0 4px;color:var(--text-muted);font-size:12px">点「看电视」播放<b>默认频道</b>；或点某频道右侧 ▶ 播放该频道（经设备 <code>:8082</code>）。「同步到设备」让手机/设备浏览器也能选台。下方为<b>设备实时日志</b>证据（看 <code>media_navi_open 成功</code> / <code>停止播放</code>）。</div>
+          <div id="tvLogBox" class="log-container" style="max-height:220px;overflow:auto"></div>
+        </section>
+
         <div class="grid-2-1">
           <section class="card">
             <div class="card-header"><h2>进程管理</h2><span id="processSummary" class="process-summary"></span><div class="card-actions"><button class="btn btn-ghost btn-sm" onclick="refreshProcesses()">刷新</button></div></div>
@@ -365,6 +390,8 @@
                   <option value="I">信息</option>
                   <option value="D">调试</option>
                 </select>
+                <input id="logFilterPanel" class="log-filter-input" placeholder="过滤关键词" oninput="applyLogFilter('panel')">
+                <button class="btn btn-ghost btn-xs" onclick="exportLog('panel')" title="导出日志">导出</button>
               </div>
               <div id="logPanel" class="log-container">
                 <div class="empty-state">暂无日志</div>
@@ -388,6 +415,8 @@
                   <option value="I">信息</option>
                   <option value="D">调试</option>
                 </select>
+                <input id="logFilterXwebd" class="log-filter-input" placeholder="过滤关键词" oninput="applyLogFilter('xwebd')">
+                <button class="btn btn-ghost btn-xs" onclick="exportLog('xwebd')" title="导出日志">导出</button>
               </div>
               <div id="logXwebd" class="log-container">
                 <div class="empty-state">等待连接设备...</div>
@@ -411,6 +440,8 @@
                   <option value="I">信息</option>
                   <option value="D">调试</option>
                 </select>
+                <input id="logFilterAssistant" class="log-filter-input" placeholder="过滤关键词" oninput="applyLogFilter('assistant')">
+                <button class="btn btn-ghost btn-xs" onclick="exportLog('assistant')" title="导出日志">导出</button>
               </div>
               <div id="logAssistant" class="log-container">
                 <div class="empty-state">等待连接设备...</div>

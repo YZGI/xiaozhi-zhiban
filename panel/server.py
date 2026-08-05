@@ -441,6 +441,162 @@ def _api_device_logs_stream(handler, xwebd, body, query):
     return _STREAM_SENTINEL
 
 
+# ==================== 看电视 (TV) ====================
+TV_WEB_PORT = 8082  # 设备端 tv_web 服务端口（与 device/assistant/src/tv_web.c 一致）
+
+
+def _tv_web_call(xwebd, action, timeout=10, url=None):
+    """调用设备端 tv_web 服务(:8082)的播放/停止/状态接口。
+
+    Args:
+        xwebd: 已连接的 XwebdAPI 实例（提供设备 host）
+        action: "play" / "stop" / "status"
+        url: 可选，播放指定频道地址（会 urlencode 后作为 ?url= 传给设备）
+    Returns:
+        dict: tv_web 返回的 JSON，或 {"error": "..."}
+    """
+    u = f"http://{xwebd.host}:{TV_WEB_PORT}/tv/{action}"
+    if action == "play" and url:
+        u += "?url=" + url_quote(url, safe="")
+    try:
+        req = Request(u, method="GET")
+        with urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(data)
+            except Exception:
+                return {"raw": data}
+    except Exception as e:
+        logger.warning("tv_web 调用失败 action=%s: %s", action, e)
+        return {"error": str(e)}
+
+
+@_api_route("POST", "/api/tv/play")
+@_requires_xwebd
+def _api_tv_play(handler, xwebd, body, query):
+    url = None
+    if body and body.get("url"):
+        url = body["url"]
+    elif query.get("url", [None])[0]:
+        url = query["url"][0]
+    return _tv_web_call(xwebd, "play", url=url)
+
+
+@_api_route("POST", "/api/tv/stop")
+@_requires_xwebd
+def _api_tv_stop(handler, xwebd, body, query):
+    return _tv_web_call(xwebd, "stop")
+
+
+@_api_route("GET", "/api/tv/status")
+@_requires_xwebd
+def _api_tv_status(handler, xwebd, body, query):
+    return _tv_web_call(xwebd, "status")
+
+
+@_api_route("GET", "/api/tv/log")
+@_requires_xwebd
+def _api_tv_log(handler, xwebd, body, query):
+    """读取设备日志，过滤电视播放相关行，并据此推断当前是否在播放。
+
+    判断逻辑（来自真实日志取证，而非仅依赖 tv_web 内存状态）：
+    - 出现 "media_navi_open 成功" 或 "TVWEB 网页触发 看电视" → 进入播放
+    - 出现 "停止播放 (media_navi_close)" 或 "TVWEB 网页触发 关电视" → 退出播放
+    取最近一次事件决定 playing。
+    """
+    lines = int(query.get("lines", [300])[0])
+    lines = max(50, min(lines, 1000))
+    result = xwebd.get_logs(lines=lines)
+    if "error" in result:
+        return result
+    logs = result.get("logs", [])
+    keywords = ["media_navi_open 成功", "停止播放 (media_navi_close)",
+                "TVWEB 网页触发 看电视", "TVWEB 网页触发 关电视",
+                "[TV]", "mcp_play"]
+    tv_logs = [e for e in logs
+               if isinstance(e, dict) and any(k in e.get("text", "") for k in keywords)]
+    playing = False
+    last_event = None
+    last_url = None
+    for e in tv_logs:
+        t = e.get("text", "")
+        if "media_navi_open 成功" in t:
+            playing = True
+            last_event = "play"
+            marker = "media_navi_open 成功: "
+            idx = t.find(marker)
+            if idx >= 0:
+                last_url = t[idx + len(marker):].strip()
+        elif "TVWEB 网页触发 看电视" in t:
+            playing = True
+            last_event = "play"
+        elif "停止播放" in t or "TVWEB 网页触发 关电视" in t:
+            playing = False
+            last_event = "stop"
+    return {
+        "playing": playing,
+        "last_event": last_event,
+        "last_url": last_url,
+        "log_count": len(tv_logs),
+        "logs": tv_logs[-80:],
+    }
+
+
+# ==================== 看电视 · 频道 (Channels) ====================
+TV_CHANNELS_DEVICE_PATH = "/var/upgrade/tv_channels.json"
+
+
+def _xwebd_upload_text(xwebd, device_dir, filename, text):
+    """通过 xwebd /api/files/upload 把文本内容写成设备上的文件。
+
+    注意：该 xwebd 的 upload 要求 multipart 且会把「所有 part 的内容」顺序写入文件，
+    因此这里只发【一个 file part】，目录通过查询参数 path= 传递，避免把 path 字段也写进文件。
+    """
+    boundary = "----tvpanelboundary7Q"
+    b = bytearray()
+    b += ("--" + boundary + "\r\n").encode("utf-8")
+    b += ('Content-Disposition: form-data; name="file"; filename="%s"\r\n' % filename).encode("utf-8")
+    b += b"Content-Type: application/json\r\n\r\n"
+    b += text.encode("utf-8")
+    b += b"\r\n"
+    b += ("--" + boundary + "--\r\n").encode("utf-8")
+    u = "http://%s:%d/api/files/upload?path=%s" % (xwebd.host, XWEBD_PORT, device_dir)
+    req = Request(u, data=bytes(b), method="POST")
+    req.add_header("Content-Type", "multipart/form-data; boundary=" + boundary)
+    with urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+@_api_route("GET", "/api/tv/channels")
+@_requires_xwebd
+def _api_tv_channels_get(handler, xwebd, body, query):
+    """从设备读取频道列表（/var/upgrade/tv_channels.json）。"""
+    u = "http://%s:%d/api/files/download?path=%s" % (
+        xwebd.host, XWEBD_PORT, TV_CHANNELS_DEVICE_PATH)
+    try:
+        with urlopen(u, timeout=8) as resp:
+            data = resp.read().decode("utf-8", "replace")
+        return json.loads(data)
+    except Exception as e:
+        logger.info("读取设备频道列表失败(视为空): %s", e)
+        return []
+
+
+@_api_route("PUT", "/api/tv/channels")
+@_requires_xwebd
+def _api_tv_channels_put(handler, xwebd, body, query):
+    """把频道列表写入设备（供设备/手机浏览器 :8082 页选台）。"""
+    channels = (body or {}).get("channels", [])
+    if not isinstance(channels, list):
+        return {"error": "channels 必须是数组"}, 400
+    text = json.dumps(channels, ensure_ascii=False, indent=2)
+    try:
+        return _xwebd_upload_text(xwebd, "/var/upgrade", "tv_channels.json", text)
+    except Exception as e:
+        logger.warning("写入设备频道列表失败: %s", e)
+        return {"error": str(e)}, 500
+
+
 @_api_route("GET", "/api/processes")
 @_requires_xwebd
 def _api_processes(handler, xwebd, body, query):

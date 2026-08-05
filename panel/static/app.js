@@ -24,10 +24,21 @@ var S = {
 };
 
 var LOG = {
-    xwebd: { clearLine: -1, lastCount: 0 },
-    assistant: { clearLine: -1, lastCount: 0 },
-    panel: { clearLine: -1, lastCount: 0 }
+    xwebd: { clearLine: -1, lastCount: 0, rawLines: [] },
+    assistant: { clearLine: -1, lastCount: 0, rawLines: [] },
+    panel: { clearLine: -1, lastCount: 0, rawLines: [] }
 };
+
+/* 日志过滤关键词（按源） */
+var _logFilter = { panel: '', xwebd: '', assistant: '' };
+
+/* 看电视频道列表（localStorage 持久化，修复原 mcpTools 不保存的毛病） */
+var tvChannels = [];
+var tvDefaultIdx = 0;
+
+/* 多设备列表（localStorage 持久化） */
+var devices = [];
+var activeDevice = '';
 
 var STATE_MAP = {
     'Idle': '空闲',
@@ -380,6 +391,194 @@ function renderLogLine(l) {
     var colors = {logInfo:'#d4d4d4', logError:'#f44747', logWarn:'#e5c07b', logDebug:'#569cd6', logCritical:'#ff4cff'};
     return '<span style="color:' + (colors[cls] || '#d4d4d4') + '">' + escapeHtml(clean) + '</span>';
 }
+
+// ==================== 看电视 ====================
+async function tvPlay() {
+    var r = await api('/api/tv/play', {method:'POST'});
+    if (r.error) { toast('看电视失败: ' + r.error, 'error'); }
+    else { toast('已发送「看电视」指令', 'success'); }
+    tvRefresh();
+}
+async function tvStop() {
+    var r = await api('/api/tv/stop', {method:'POST'});
+    if (r.error) { toast('关电视失败: ' + r.error, 'error'); }
+    else { toast('已发送「关电视」指令', 'success'); }
+    tvRefresh();
+}
+async function tvRefresh() {
+    var badge = $('tvStatusBadge');
+    if (!badge) return;
+    var r = await api('/api/tv/log');
+    if (r.error) {
+        badge.className = 'status-pill offline';
+        badge.innerHTML = '<span class="status-dot offline"></span>设备离线';
+        var box = $('tvLogBox');
+        if (box) box.innerHTML = '<div class="empty-state">无法读取设备日志: ' + escapeHtml(r.error) + '</div>';
+        return;
+    }
+    if (r.playing) {
+        badge.className = 'status-pill online';
+        var label = '正在播放' + (r.last_url ? ' (' + escapeHtml(r.last_url.split('/').pop()) + ')' : '');
+        badge.innerHTML = '<span class="status-dot online"></span>' + label;
+    } else {
+        badge.className = 'status-pill offline';
+        badge.innerHTML = '<span class="status-dot offline"></span>未播放';
+    }
+    var logs = r.logs || [];
+    var box = $('tvLogBox');
+    if (!box) return;
+    if (!logs.length) {
+        box.innerHTML = '<div class="empty-state">暂无电视播放日志</div>';
+        return;
+    }
+    var html = '';
+    logs.forEach(function(e) {
+        var text = (e && typeof e === 'object' && e.text) ? e.text : String(e);
+        html += '<div class="log-line">' + renderLogLine(text) + '</div>';
+    });
+    box.innerHTML = html;
+    box.scrollTop = box.scrollHeight;
+}
+
+// ==================== 看电视 · 频道管理 ====================
+function loadTvChannels() {
+    try { tvChannels = JSON.parse(localStorage.getItem('tvChannels') || 'null') || []; }
+    catch (e) { tvChannels = []; }
+    tvDefaultIdx = parseInt(localStorage.getItem('tvDefaultIdx') || '0', 10) || 0;
+}
+function saveTvChannels() {
+    localStorage.setItem('tvChannels', JSON.stringify(tvChannels));
+    localStorage.setItem('tvDefaultIdx', String(tvDefaultIdx));
+}
+function renderTvChannels() {
+    var box = $('tvChannelsList');
+    if (!box) return;
+    if (!tvChannels.length) {
+        box.innerHTML = '<div class="empty-state" style="padding:10px">暂无频道，点「+ 频道」添加（如 央视/卫视/儿歌直播源 m3u8）</div>';
+        return;
+    }
+    var html = '';
+    tvChannels.forEach(function(c, i) {
+        var def = (i === tvDefaultIdx);
+        html += '<div class="tv-ch-item">';
+        html += '<span class="tv-ch-name">' + escapeHtml(c.name) + (def ? ' <span class="tv-ch-def">默认</span>' : '') + '</span>';
+        html += '<span class="tv-ch-url">' + escapeHtml(c.url || '') + '</span>';
+        html += '<span class="tv-ch-actions">';
+        html += '<button class="btn btn-primary btn-xs" onclick="tvPlayChannel(' + i + ')">▶ 播放</button>';
+        html += '<button class="btn btn-ghost btn-xs" onclick="tvChannelEdit(' + i + ')">编辑</button>';
+        html += '<button class="btn btn-ghost btn-xs" onclick="tvSetDefault(' + i + ')">默认</button>';
+        html += '<button class="btn btn-danger btn-xs" onclick="tvChannelDel(' + i + ')">删</button>';
+        html += '</span></div>';
+    });
+    box.innerHTML = html;
+}
+function tvChannelAdd() {
+    var name = prompt('频道名称：', '我的频道');
+    if (name === null) return;
+    var url = prompt('频道地址 (m3u8 / rtsp / http 视频流)：', 'https://');
+    if (url === null) return;
+    tvChannels.push({ name: name.trim() || '未命名', url: url.trim() });
+    if (tvChannels.length === 1) tvDefaultIdx = 0;
+    saveTvChannels(); renderTvChannels();
+    toast('已添加频道', 'success');
+}
+function tvChannelEdit(i) {
+    var c = tvChannels[i]; if (!c) return;
+    var name = prompt('频道名称：', c.name);
+    if (name === null) return;
+    var url = prompt('频道地址：', c.url);
+    if (url === null) return;
+    tvChannels[i] = { name: name.trim() || '未命名', url: url.trim() };
+    saveTvChannels(); renderTvChannels();
+}
+function tvChannelDel(i) {
+    if (!confirm('删除频道「' + (tvChannels[i] ? tvChannels[i].name : '') + '」？')) return;
+    tvChannels.splice(i, 1);
+    if (tvDefaultIdx >= tvChannels.length) tvDefaultIdx = Math.max(0, tvChannels.length - 1);
+    saveTvChannels(); renderTvChannels();
+}
+function tvSetDefault(i) {
+    tvDefaultIdx = i; saveTvChannels(); renderTvChannels();
+    toast('已设为默认频道', 'success');
+}
+async function tvPlayChannel(i) {
+    var c = tvChannels[i]; if (!c) return;
+    var r = await api('/api/tv/play', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: c.url }) });
+    if (r.error) toast('播放失败: ' + r.error, 'error');
+    else toast('正在播放：' + c.name, 'success');
+    tvRefresh();
+}
+async function tvSyncToDevice() {
+    if (!tvChannels.length) { toast('先添加频道再同步', 'error'); return; }
+    var r = await api('/api/tv/channels', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ channels: tvChannels }) });
+    if (r.error) toast('同步失败: ' + r.error, 'error');
+    else toast('已同步 ' + tvChannels.length + ' 个频道到设备', 'success');
+}
+async function tvLoadFromDevice() {
+    var r = await api('/api/tv/channels');
+    if (r.error) { toast('读取失败: ' + r.error, 'error'); return; }
+    if (Array.isArray(r) && r.length) {
+        tvChannels = r; saveTvChannels(); renderTvChannels();
+        toast('已从设备读取 ' + r.length + ' 个频道', 'success');
+    } else {
+        toast('设备暂无频道', 'info');
+    }
+}
+
+// ==================== 多设备管理 ====================
+function loadDevices() {
+    try { devices = JSON.parse(localStorage.getItem('panelDevices') || 'null') || []; }
+    catch (e) { devices = []; }
+    activeDevice = localStorage.getItem('panelActiveDevice') || '';
+}
+function saveDevices() {
+    localStorage.setItem('panelDevices', JSON.stringify(devices));
+    localStorage.setItem('panelActiveDevice', activeDevice);
+}
+function renderDeviceSelect() {
+    var sel = $('deviceSelect');
+    if (!sel) return;
+    sel.innerHTML = '';
+    devices.forEach(function(d) {
+        var o = document.createElement('option');
+        o.value = d.host;
+        o.textContent = d.name + ' (' + d.host + ')' + (d.host === activeDevice ? ' ✓' : '');
+        sel.appendChild(o);
+    });
+    if (activeDevice) sel.value = activeDevice;
+}
+async function switchDevice() {
+    var sel = $('deviceSelect');
+    var host = sel ? sel.value : '';
+    if (!host) return;
+    var r = await api('/api/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ host: host }) });
+    if (r.error) { toast('切换设备失败: ' + r.error, 'error'); return; }
+    activeDevice = host; saveDevices(); renderDeviceSelect();
+    toast('已切换到 ' + host, 'success');
+    if (typeof refreshStatus === 'function') refreshStatus();
+    tvRefresh();
+    if (typeof refreshConfig === 'function') refreshConfig();
+}
+function addDevice() {
+    var name = prompt('设备名称：', '设备');
+    if (name === null) return;
+    var host = prompt('设备 IP（如 192.168.1.19）：', '192.168.1.19');
+    if (host === null) return;
+    host = host.trim();
+    if (!host) return;
+    if (devices.some(function(d) { return d.host === host; })) { toast('该设备已存在', 'info'); return; }
+    devices.push({ name: name.trim() || host, host: host });
+    if (!activeDevice) activeDevice = host;
+    saveDevices(); renderDeviceSelect();
+    toast('已添加设备 ' + host, 'success');
+}
+
+// 进入无线页且卡片可见时每 5 秒刷新一次播放状态（基于设备日志取证）
+setInterval(function() {
+    var el = $('tvCard');
+    if (el && el.offsetParent !== null) tvRefresh();
+}, 5000);
+tvRefresh();
 
 // ==================== ADB (Wired Mode) ====================
 
@@ -2055,6 +2254,32 @@ async function refreshLogPanel(source, flash) {
     if (flash) flashEl($(containerId));
 }
 
+function buildLogHtml(lines) {
+    var html = '';
+    lines.forEach(function(l) {
+        if (typeof l === 'string') {
+            html += '<div class="log-line">' + renderLogLine(l) + '</div>';
+        } else {
+            var cls = 'log-info';
+            if (l.level === 'ERROR' || l.level === 'E' || l.level === 'CRITICAL') cls = 'log-error';
+            else if (l.level === 'WARN' || l.level === 'W' || l.level === 'WARNING') cls = 'log-warn';
+            else if (l.level === 'DEBUG' || l.level === 'D') cls = 'log-debug';
+            var src = l.source ? '<span class="log-source">[' + l.source + ']</span> ' : '';
+            html += '<div class="log-line ' + cls + '">' + src + escapeHtml(stripAnsi(l.text || l.message || '')) + '</div>';
+        }
+    });
+    return html;
+}
+
+function _filterLogLines(lines, source) {
+    var f = (_logFilter[source] || '').trim().toLowerCase();
+    if (!f) return lines;
+    return lines.filter(function(l) {
+        var t = (typeof l === 'string') ? l : (l.text || l.message || JSON.stringify(l));
+        return (t || '').toLowerCase().indexOf(f) >= 0;
+    });
+}
+
 function renderLogPanel(containerId, r, source) {
     var container = $(containerId);
     if (!container) return;
@@ -2072,25 +2297,47 @@ function renderLogPanel(containerId, r, source) {
     }
     ls.lastCount = allLines.length;
     var lines = allLines.slice(skipCount);
+    ls.rawLines = lines;
+    lines = _filterLogLines(lines, source);
     if (!lines.length) {
-        container.innerHTML = '<div class="empty-state">暂无日志</div>';
+        container.innerHTML = '<div class="empty-state">暂无日志' + ((_logFilter[source] || '').trim() ? '（过滤无匹配）' : '') + '</div>';
         return;
     }
-    var html = '';
-    lines.forEach(function(l) {
-        if (typeof l === 'string') {
-            html += '<div class="log-line">' + renderLogLine(l) + '</div>';
-        } else {
-            var cls = 'log-info';
-            if (l.level === 'ERROR' || l.level === 'E' || l.level === 'CRITICAL') cls = 'log-error';
-            else if (l.level === 'WARN' || l.level === 'W' || l.level === 'WARNING') cls = 'log-warn';
-            else if (l.level === 'DEBUG' || l.level === 'D') cls = 'log-debug';
-            var src = l.source ? '<span class="log-source">[' + l.source + ']</span> ' : '';
-            html += '<div class="log-line ' + cls + '">' + src + escapeHtml(stripAnsi(l.text || l.message || '')) + '</div>';
-        }
-    });
-    container.innerHTML = html;
+    container.innerHTML = buildLogHtml(lines);
     requestAnimationFrame(function() { container.scrollTop = container.scrollHeight; });
+}
+
+/* 关键词过滤（不重新拉取，直接对上次的原始日志过滤） */
+function applyLogFilter(source) {
+    var el = $('logFilter' + source.charAt(0).toUpperCase() + source.slice(1));
+    _logFilter[source] = el ? el.value : '';
+    var ls = LOG[source];
+    if (!ls.rawLines) { refreshLogPanel(source, false); return; }
+    var container = $(getLogContainerId(source));
+    if (!container) return;
+    var lines = _filterLogLines(ls.rawLines, source);
+    if (!lines.length) {
+        container.innerHTML = '<div class="empty-state">暂无日志（过滤无匹配）</div>';
+        return;
+    }
+    container.innerHTML = buildLogHtml(lines);
+}
+
+/* 导出当前（过滤后）日志为 txt */
+function exportLog(source) {
+    var ls = LOG[source];
+    var lines = _filterLogLines(ls.rawLines || [], source);
+    var text = lines.map(function(l) {
+        return (typeof l === 'string') ? l : (l.text || l.message || JSON.stringify(l));
+    }).join('\n');
+    var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'log_' + source + '_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.txt';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function() { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    toast('已导出 ' + lines.length + ' 行日志', 'success');
 }
 
 function clearLogPanel(source) {
@@ -2149,6 +2396,10 @@ function connectPanelSSE() {
             div.className = 'log-line';
             div.innerHTML = renderLogLine(data.text || '');
             container.appendChild(div);
+            if (LOG.panel.rawLines) {
+                LOG.panel.rawLines.push(data.text || '');
+                if (LOG.panel.rawLines.length > 500) LOG.panel.rawLines.shift();
+            }
             if (container.children.length > 500) container.removeChild(container.firstChild);
             container.scrollTop = container.scrollHeight;
         };
@@ -2583,6 +2834,22 @@ document.addEventListener('DOMContentLoaded', function() {
     applyMode();
     updateSairLocks();
     renderMcpTools();
+
+    /* 看电视频道 + 多设备：从 localStorage 恢复并渲染；首次用 /api/info 的 host 播种 */
+    loadTvChannels();
+    renderTvChannels();
+    loadDevices();
+    (async function() {
+        try {
+            var info = await api('/api/info');
+            var h = info && info.xwebd_host;
+            if (h && !devices.some(function(d) { return d.host === h; })) {
+                devices.push({ name: '当前设备', host: h });
+            }
+            if (!activeDevice && h) activeDevice = h;
+            saveDevices(); renderDeviceSelect();
+        } catch (e) { renderDeviceSelect(); }
+    })();
 
     document.querySelectorAll('.svc-list,.file-container,.log-container,.diag-container,.mcp-tools-list,.adb-device-list,.modal').forEach(function(el) {
         el.addEventListener('wheel', function(e) {
