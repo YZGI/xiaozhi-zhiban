@@ -25,6 +25,14 @@
 #include <fcntl.h>
 #include <linux/input.h>
 
+/* 默认电视源（公开 HLS 测试流，请改成你的频道 m3u8/rtsp 地址） */
+#ifndef TV_DEFAULT_URL
+#define TV_DEFAULT_URL "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+#endif
+#ifndef TV_DEFAULT_VOL
+#define TV_DEFAULT_VOL 30
+#endif
+
 /* 动态加载符号的宏，加载失败时输出警告日志 */
 #define LOAD_SYM(h, name, type)                     \
     do                                              \
@@ -68,6 +76,23 @@ int mcp_handler_init(mcp_handler_t *mcp)
     /* 加载TTS播放函数 */
     LOAD_SYM(mcp->lib_handle, sound_tts_play, void (*)(int));
 
+    /* 加载视频播放库 (工厂硬件解码 libsmart_player_api.so) */
+    mcp->player_handle = dlopen("libsmart_player_api.so", RTLD_NOW);
+    if (mcp->player_handle)
+    {
+        LOAD_SYM(mcp->player_handle, splayer_open, int (*)(void));
+        LOAD_SYM(mcp->player_handle, splayer_close, int (*)(void));
+        LOAD_SYM(mcp->player_handle, splayer_stop, int (*)(void));
+        LOAD_SYM(mcp->player_handle, splayer_set_file, int (*)(const char *));
+        LOAD_SYM(mcp->player_handle, splayer_play, int (*)(void));
+        LOAD_SYM(mcp->player_handle, splayer_set_volume, int (*)(int));
+        PLOG_I("MCP", "已加载 libsmart_player_api.so");
+    }
+    else
+    {
+        PLOG_W("MCP", "加载 libsmart_player_api.so 失败: %s", dlerror());
+    }
+
     PLOG_I("MCP", "初始化完成，已加载 libmsg_server_api.so");
     return 0;
 }
@@ -80,6 +105,11 @@ void mcp_handler_destroy(mcp_handler_t *mcp)
 {
     if (!mcp)
         return;
+    if (mcp->player_handle)
+    {
+        dlclose(mcp->player_handle);
+        mcp->player_handle = NULL;
+    }
     if (mcp->lib_handle)
     {
         dlclose(mcp->lib_handle);
@@ -487,6 +517,31 @@ static int exec_tool(mcp_handler_t *mcp, const char *name, const char *args_json
         return 0;
     }
 
+    /* 看电视：播放指定网络 URL（复用工厂硬件解码 libsmart_player_api.so） */
+    if (strcmp(name, "self.play_tv") == 0)
+    {
+        char url[1024] = {0};
+        find_string(args_json, args_len, "url", url, sizeof(url));
+        if (url[0] == '\0')
+            strncpy(url, TV_DEFAULT_URL, sizeof(url) - 1);
+
+        if (!mcp->splayer_set_file || !mcp->splayer_play)
+        {
+            snprintf(result, result_size, "player lib not loaded");
+            return -1;
+        }
+        if (mcp->splayer_stop)
+            mcp->splayer_stop();
+        if (mcp->splayer_open)
+            mcp->splayer_open();
+        mcp->splayer_set_file(url);
+        if (mcp->splayer_set_volume)
+            mcp->splayer_set_volume(TV_DEFAULT_VOL);
+        mcp->splayer_play();
+        snprintf(result, result_size, "playing %s", url);
+        return 0;
+    }
+
     snprintf(result, result_size, "unknown tool: %s", name);
     return -1;
 }
@@ -618,7 +673,8 @@ void mcp_handler_process_message(mcp_handler_t *mcp, const char *json, size_t le
                                  "{\"name\":\"self.clean_junk\",\"description\":\"Clean temporary files and drop system caches to free memory and improve performance\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                                  "{\"name\":\"self.get_mcp_tools\",\"description\":\"List and describe all available MCP tools on this device\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
                                  "{\"name\":\"self.reboot\",\"description\":\"Reboot the device\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}},\"annotations\":{\"audience\":[\"user\"]}},"
-                                 "{\"name\":\"self.poweroff\",\"description\":\"Power off the device\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}},\"annotations\":{\"audience\":[\"user\"]}}"
+                                 "{\"name\":\"self.poweroff\",\"description\":\"Power off the device\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}},\"annotations\":{\"audience\":[\"user\"]}},"
+                                 "{\"name\":\"self.play_tv\",\"description\":\"Play a TV/stream URL on the device screen with hardware decoder. Use when the user says watch TV, watch a channel, or play a streaming URL. Argument: url (string, the m3u8/hls/rtsp address; if omitted use the default channel).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Stream URL to play\"}}}}"
                                  "]}}}",
                                  (long long)id);
                 mcp->send_json(json, n, mcp->user_data);

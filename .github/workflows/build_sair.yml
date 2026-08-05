@@ -1,0 +1,40 @@
+name: Build sair (ARM uClibc, with self.play_tv)
+
+# 在 Linux runner 上原生运行 buildroot 工具链，编译含 self.play_tv 的 sair。
+# 前置：仓库内需包含 device/assistant/ (源码) 与 device/toolchain/tc.tar.xz (ARM uClibc 工具链)。
+on:
+  workflow_dispatch:        # 允许在 Actions 页面手动触发
+  push:
+    paths:
+      - 'device/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install xz-utils & Extract ARM uClibc toolchain
+        run: |
+          which xz || (apt-get update && apt-get install -y xz-utils)
+          cd device/toolchain
+          test -f tc.tar.xz || { echo "❌ 缺少 device/toolchain/tc.tar.xz"; exit 1; }
+          tar xJf tc.tar.xz
+          ls arm-buildroot-linux-uclibcgnueabi_sdk-buildroot/bin/arm-buildroot-linux-uclibcgnueabi-gcc
+
+      - name: Build sair (includes self.play_tv)
+        run: |
+          cd device/assistant
+          bash build.sh
+
+      - name: Verify self.play_tv is present
+        run: |
+          grep -q "self.play_tv" device/assistant/src/mcp_handler.c \
+            && echo "✅ self.play_tv wired" || echo "⚠️ play_tv not found"
+
+      - name: Upload sair artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sair
+          path: device/assistant/prebuilt/sair

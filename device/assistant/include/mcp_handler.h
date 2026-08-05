@@ -19,6 +19,15 @@ typedef struct {
     int (*power_get_battery_voltage)(void);
     void (*sound_tts_play)(int index);
 
+    /* 视频播放库 (libsmart_player_api.so, 工厂硬件解码) */
+    void *player_handle;
+    int (*splayer_open)(void);
+    int (*splayer_close)(void);
+    int (*splayer_stop)(void);
+    int (*splayer_set_file)(const char *url);
+    int (*splayer_play)(void);
+    int (*splayer_set_volume)(int vol);
+
     mcp_send_json_cb_t send_json;
     void *user_data;
 } mcp_handler_t;
