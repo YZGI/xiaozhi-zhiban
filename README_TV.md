@@ -5,7 +5,7 @@
 
 ---
 
-## ⚠️ 重要前提：为什么必须在本机「以外」的 Linux/WSL 环境编译
+## ⚠️ 重要前提：为什么必须在本机「以外」的 Linux 环境编译
 
 本机（Windows LTSC 19044）**无法在本机完成交叉编译**，原因已逐一排查确认：
 
@@ -14,7 +14,10 @@
 2. **QEMU 用户态模拟不支持 Windows 宿主**：官方确认 “QEMU user mode emulator is not yet available for Windows host,
    there is no plan to add such a feature”，因为 Linux syscall ABI 在 Windows 上不稳定/无文档。
    Windows 版 qemu 只能做**整机虚拟化**（系统模拟），而本机带宽为 ~60KB/s，下载 Ubuntu 镜像不现实。
-3. 结论：**编译必须在你那台正常的 WSL / Linux 机器上进行**；部署则可以从任意能访问设备 `8080` 端口的机器执行（Windows Git Bash 或 WSL 均可）。
+3. 结论：**编译不能在本机 Windows 上做**，但你有两条「本机以外」的路：
+   - ✅ **推荐：GitHub Actions 云编译**（见下方「方式 C」）—— 仓库已配好工作流，push 后 GitHub 的 Linux 机器自动编出 `sair`，本机零编译、零安装。
+   - 备选：你另一台正常的 WSL / Linux 机器（见「方式 A / B」）。
+   - 部署则可以从任意能访问设备 `8080` 端口的机器执行（Windows Git Bash 或 WSL 均可）。
 
 > 源码已内置 `self.play_tv`，位于 `device/assistant/src/mcp_handler.c`（实现于第 521 行，
 > 并在 `tools/list` 第 677 行注册）。**无需改任何代码**，正常构建即可包含该功能。
@@ -43,6 +46,28 @@
    （解压后应有 `bin/arm-buildroot-linux-uclibcgnueabi-gcc` 和
    `arm-buildroot-linux-uclibcgnueabi/sysroot`）。
 3. 或改用环境变量：`export SDK_PATH=/你的工具链/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot`
+
+### 方式 C：GitHub Actions 云编译（推荐，本机零编译）
+
+仓库已内置 `.github/workflows/build_sair.yml`。push 后在 GitHub 的 **Linux runner 上原生运行 buildroot 工具链**编译出 `sair`，
+并把产物作为 **Artifact** 下发。本机（Windows）无需安装任何编译器/虚拟机。
+
+> 前置已就绪：本仓库已包含 `device/toolchain/tc.tar.xz`（56MB ARM uClibc 工具链，已加入 `.gitignore` 白名单），
+> 且 `remote` 已指向你的 GitHub 仓库（`origin`）。
+
+1. **提交并推送**（本机已在 `develop` 分支完成所有改动提交，直接推）：
+   ```bash
+   git push origin develop
+   ```
+   > 若远端 `develop` 比本地新导致拒绝，先 `git pull --rebase origin develop` 再推。
+2. 推送后 **Actions 自动触发**（push 触及 `device/**`）；也可手动：仓库 → **Actions** → `Build sair` → **Run workflow**。
+3. 构建完成后：该次运行页 → **Artifacts** → 下载 `sair`（即编译好的二进制）。
+4. 下载后按「步骤四」部署：`bash deploy_tv.sh <设备IP> ~/Downloads/sair`
+
+编译日志会打印 `✅ self.play_tv wired` 与 `Strip: ... -> ... bytes`，确认看电视功能已编入。
+
+> 说明：runner 上工具链为**静态链接**，零主机依赖；`tc.tar.xz` 由工作流自动解压到 `device/toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot`，
+> 然后 `bash build.sh` 编译 20 个 .c 并链接。
 
 ## 步骤三：编译
 
