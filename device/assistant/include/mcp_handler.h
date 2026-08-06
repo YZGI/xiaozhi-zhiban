@@ -55,8 +55,8 @@ typedef struct {
        屏幕视频层。看电视主路径用此；splayer_*(误入音频引擎)/media_navi_open(到
        msg_server)/mp_*(仅音频) 逐级兜底。 */
     void *olmedia_handle;
-    int (*olmedia_open)(const char *url);
-    int (*olmedia_close)(int handle);
+    int (*olmedia_api_open)(const char *url);
+    int (*olmedia_api_close)(int handle);
 
     mcp_send_json_cb_t send_json;
     void *user_data;

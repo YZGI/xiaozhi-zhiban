@@ -164,7 +164,7 @@ int mcp_handler_init(mcp_handler_t *mcp)
         LOAD_SYM(mcp->olmedia_handle, olmedia_api_open, int (*)(const char *));
         LOAD_SYM(mcp->olmedia_handle, olmedia_api_close, int (*)(int));
         PLOG_I("MCP", "已加载 libolmedia_api.so (olmedia_api_open=%s)",
-               mcp->olmedia_open ? "ok" : "缺失");
+               mcp->olmedia_api_open ? "ok" : "缺失");
     }
     else
     {
@@ -228,9 +228,9 @@ int mcp_stop_tv(mcp_handler_t *mcp)
     pthread_mutex_lock(&g_tv_mutex);
     /* 视频主路径：关闭 olmedia 句柄（olmedia_api_close 收掉 olmedia_service 侧的
        渲染会话），并 splayer_stop 清掉 smart_player 可能残留的视频层。 */
-    if (mcp && mcp->olmedia_close && g_olmedia_handle >= 0)
+    if (mcp && mcp->olmedia_api_close && g_olmedia_handle >= 0)
     {
-        mcp->olmedia_close(g_olmedia_handle);
+        mcp->olmedia_api_close(g_olmedia_handle);
         g_olmedia_handle = -1;
         ret = 0;
         PLOG_I("TV", "停止播放 (olmedia_close)");
@@ -287,9 +287,9 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
          - olmedia_api_open → 发往 olmedia_service，是工厂视频出画的唯一正确链路。
        url 须用设备能直连的地址：本地 http 的 ts/hls 流，或公网 http 的 m3u8。
        设备无用户态 TLS，勿用 https。 */
-    if (mcp->olmedia_open)
+    if (mcp->olmedia_api_open)
     {
-        int h = mcp->olmedia_open(url);
+        int h = mcp->olmedia_api_open(url);
         PLOG_I("TV", "olmedia_api_open(视频主路径): %s (handle=%d)", url, h);
         if (h >= 0)
         {
