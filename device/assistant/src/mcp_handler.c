@@ -277,29 +277,34 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
 
     int ok = -1;
 
-    /* 主路径：设备原厂在线媒体库 libolmedia_api.so 的 olmedia_api_open(url)。
-       这是工厂"学习软件/看电视"真正出画的视频接口：olmedia_api_open 经
-       send_service_cmd 发给常驻的 olmedia_service 守护(pid 209)，由其驱动
-       smart_player 硬解并渲染到屏幕视频层。
-       实测对比（dmesg 证据）：
-         - splayer_*   → 误入 smart_player 的音频 musicplayer 引擎，不出画；
-         - media_navi_open → 发往 msg_server 浏览器，对本进程为 no-op，不出画；
-         - olmedia_api_open → 发往 olmedia_service，是工厂视频出画的唯一正确链路。
-       url 须用设备能直连的地址：本地 http 的 ts/hls 流，或公网 http 的 m3u8。
-       设备无用户态 TLS，勿用 https。 */
-    if (mcp->olmedia_api_open)
+    /* 测试主路径：media_navi_open(url) 发往 msg_server(pid 157) 媒体浏览/播放服务。
+       此前误判其为 no-op，是因当时只看了 smart_player 的 dmesg、没看 msg_server
+       自身反应。本测试置为首路径并捕获 msg_server(157) dmesg，验证其能否直接播
+       任意 URL（ts/hls）。若其返回 0 即视为出画链路已启动。 */
+    if (mcp->media_navi_open)
+    {
+        int r = mcp->media_navi_open(url);
+        PLOG_I("TV", "media_navi_open 播放(测试主路径): %s (ret=%d)", url, r);
+        if (r == 0)
+            ok = 0;
+    }
+    else
+    {
+        PLOG_W("TV", "media_navi_open 不可用，降级 olmedia/splayer/mp 兜底");
+    }
+
+    /* 兜底1：olmedia_api_open 发往 olmedia_service 云目录。实测它忽略任意 URL、
+       只拉厂商云目录(customCollectMediaPage)，故作为兜底；media_navi 失败时会
+       触发其云目录拉取（不影响本次对 media_navi 的判断）。 */
+    if (ok != 0 && mcp->olmedia_api_open)
     {
         int h = mcp->olmedia_api_open(url);
-        PLOG_I("TV", "olmedia_api_open(视频主路径): %s (handle=%d)", url, h);
+        PLOG_I("TV", "olmedia_api_open(兜底): %s (handle=%d)", url, h);
         if (h >= 0)
         {
             g_olmedia_handle = h;
             ok = 0;
         }
-    }
-    else
-    {
-        PLOG_W("TV", "olmedia_api_open 不可用，降级 splayer/media_navi/mp 兜底");
     }
 
     if (ok != 0 && mcp->splayer_set_file && mcp->splayer_play)
