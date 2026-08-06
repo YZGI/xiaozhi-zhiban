@@ -43,11 +43,20 @@ typedef struct {
     int (*mp_resume)(void *);
     int (*mp_set_volume)(void *, int);
 
-    /* 设备原厂媒体导航库 (libmedia_navi_api.so, 走 olmedia_service 云目录，
-       仅能播厂商云目录条目，不能播任意 URL，已弃用为播放主路径) */
+    /* 设备原厂媒体导航库 (libmedia_navi_api.so, 发往 msg_server 媒体浏览器，
+       仅能播厂商云目录条目，对本进程实测为 no-op，已弃用为播放主路径) */
     void *navi_handle;
     int (*media_navi_open)(const char *url);
     int (*media_navi_close)(void);
+
+    /* 设备原厂在线媒体库 (libolmedia_api.so, 发往 olmedia_service 守护,
+       pid 209)。这是工厂"学习软件/看电视"真正出画的视频接口：olmedia_api_open(url)
+       经 send_service_cmd("olmedia_service",...) 驱动 smart_player 硬解并渲染到
+       屏幕视频层。看电视主路径用此；splayer_*(误入音频引擎)/media_navi_open(到
+       msg_server)/mp_*(仅音频) 逐级兜底。 */
+    void *olmedia_handle;
+    int (*olmedia_open)(const char *url);
+    int (*olmedia_close)(int handle);
 
     mcp_send_json_cb_t send_json;
     void *user_data;

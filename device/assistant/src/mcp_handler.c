@@ -54,6 +54,9 @@ static int g_tv_playing = 0;
 /* mp_* 播放器句柄（mp_open 返回，跨 play/stop 复用，stop 时关闭） */
 static void *g_tv_handle = NULL;
 
+/* olmedia 视频句柄（olmedia_api_open 返回，stop 时 olmedia_api_close 关闭） */
+static int g_olmedia_handle = -1;
+
 /**
  * @brief 初始化MCP处理器
  * @param mcp MCP处理器实例指针
@@ -150,6 +153,24 @@ int mcp_handler_init(mcp_handler_t *mcp)
         PLOG_W("MCP", "加载 libmedia_navi_api.so 失败: %s (看电视将走 splayer 兜底)", dlerror());
     }
 
+    /* 加载设备原厂在线媒体库 (libolmedia_api.so)：看电视真正出画的视频接口，
+       发往常驻的 olmedia_service 守护(pid 209)，由其驱动 smart_player 硬解并
+       渲染到屏幕视频层。注意此库与 libmedia_navi_api.so 不同——后者发往
+       msg_server(仅媒体浏览器，不能播任意 URL)，本库发往 olmedia_service(真正
+       渲染视频)。若缺此库，看电视将走 splayer/media_navi/mp_* 兜底（可能仅出声）。 */
+    mcp->olmedia_handle = dlopen("libolmedia_api.so", RTLD_NOW);
+    if (mcp->olmedia_handle)
+    {
+        LOAD_SYM(mcp->olmedia_handle, olmedia_api_open, int (*)(const char *));
+        LOAD_SYM(mcp->olmedia_handle, olmedia_api_close, int (*)(int));
+        PLOG_I("MCP", "已加载 libolmedia_api.so (olmedia_api_open=%s)",
+               mcp->olmedia_open ? "ok" : "缺失");
+    }
+    else
+    {
+        PLOG_W("MCP", "加载 libolmedia_api.so 失败: %s (看电视走 splayer/media_navi 兜底)", dlerror());
+    }
+
     PLOG_I("MCP", "初始化完成，已加载 libmsg_server_api.so");
     return 0;
 }
@@ -177,6 +198,11 @@ void mcp_handler_destroy(mcp_handler_t *mcp)
         dlclose(mcp->navi_handle);
         mcp->navi_handle = NULL;
     }
+    if (mcp->olmedia_handle)
+    {
+        dlclose(mcp->olmedia_handle);
+        mcp->olmedia_handle = NULL;
+    }
     if (mcp->lib_handle)
     {
         dlclose(mcp->lib_handle);
@@ -200,6 +226,15 @@ int mcp_stop_tv(mcp_handler_t *mcp)
 {
     int ret = -1;
     pthread_mutex_lock(&g_tv_mutex);
+    /* 视频主路径：关闭 olmedia 句柄（olmedia_api_close 收掉 olmedia_service 侧的
+       渲染会话），并 splayer_stop 清掉 smart_player 可能残留的视频层。 */
+    if (mcp && mcp->olmedia_close && g_olmedia_handle >= 0)
+    {
+        mcp->olmedia_close(g_olmedia_handle);
+        g_olmedia_handle = -1;
+        ret = 0;
+        PLOG_I("TV", "停止播放 (olmedia_close)");
+    }
     /* 主路径：关闭 mp_* 播放器句柄（若上一轮用 mp_* 播的，仅出声） */
     if (g_tv_handle && mcp && mcp->mp_stop)
     {
@@ -242,41 +277,57 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
 
     int ok = -1;
 
-    /* 主路径：工厂硬解库 libsmart_player_api.so 的 splayer_*。
-       这是设备自带"学习"应用(learn.so)播视频的同款接口：splayer_set_file(url)
-       把 URL 交给常驻的 smart_player 服务——实测 smart_player 能正确收到指令
-       （其日志可见 [SPLAYER] cmd:stop 等），splayer_play() 启动 libve 硬解并
-       渲染到屏幕视频层。
-       注：media_navi_open 在本进程实测不会真正触发 smart_player 出画（dmesg
-       中无任何 play/url/decode 反应），故降级为备选。mp_* 只是音频库，仅兜底出声。 */
-    if (mcp->splayer_set_file && mcp->splayer_play)
+    /* 主路径：设备原厂在线媒体库 libolmedia_api.so 的 olmedia_api_open(url)。
+       这是工厂"学习软件/看电视"真正出画的视频接口：olmedia_api_open 经
+       send_service_cmd 发给常驻的 olmedia_service 守护(pid 209)，由其驱动
+       smart_player 硬解并渲染到屏幕视频层。
+       实测对比（dmesg 证据）：
+         - splayer_*   → 误入 smart_player 的音频 musicplayer 引擎，不出画；
+         - media_navi_open → 发往 msg_server 浏览器，对本进程为 no-op，不出画；
+         - olmedia_api_open → 发往 olmedia_service，是工厂视频出画的唯一正确链路。
+       url 须用设备能直连的地址：本地 http 的 ts/hls 流，或公网 http 的 m3u8。
+       设备无用户态 TLS，勿用 https。 */
+    if (mcp->olmedia_open)
     {
+        int h = mcp->olmedia_open(url);
+        PLOG_I("TV", "olmedia_api_open(视频主路径): %s (handle=%d)", url, h);
+        if (h >= 0)
+        {
+            g_olmedia_handle = h;
+            ok = 0;
+        }
+    }
+    else
+    {
+        PLOG_W("TV", "olmedia_api_open 不可用，降级 splayer/media_navi/mp 兜底");
+    }
+
+    if (ok != 0 && mcp->splayer_set_file && mcp->splayer_play)
+    {
+        /* 兜底1：splayer_*（实测走 smart_player 音频 musicplayer 引擎，可能仅出声） */
         if (mcp->splayer_open)
             mcp->splayer_open();
         mcp->splayer_set_file(url);
         if (mcp->splayer_set_volume)
             mcp->splayer_set_volume(TV_DEFAULT_VOL);
         int r = mcp->splayer_play();
-        PLOG_I("TV", "splayer_* 播放(视频主路径): %s (play ret=%d)", url, r);
-        ok = 0;
-    }
-    else
-    {
-        PLOG_W("TV", "splayer_* 不可用，尝试 media_navi_open 备选");
+        PLOG_I("TV", "splayer_* 播放(兜底): %s (play ret=%d)", url, r);
+        if (r == 0)
+            ok = 0;
     }
 
     if (ok != 0 && mcp->media_navi_open)
     {
-        /* 备选：media_navi_open（部分在线媒体导航列表场景使用） */
+        /* 兜底2：media_navi_open（发往 msg_server，对本进程实测为 no-op） */
         int r = mcp->media_navi_open(url);
-        PLOG_I("TV", "media_navi_open 播放(视频备选): %s (ret=%d)", url, r);
+        PLOG_I("TV", "media_navi_open 播放(兜底): %s (ret=%d)", url, r);
         if (r == 0)
             ok = 0;
     }
 
     if (ok != 0)
     {
-        /* 最终兜底：音频库 mp_*，仅出声，保证至少能听到 */
+        /* 兜底3：音频库 mp_*，仅出声，保证至少能听到 */
         if (mcp->mp_open && mcp->mp_set_file && mcp->mp_play)
         {
             void *h = mcp->mp_open();
