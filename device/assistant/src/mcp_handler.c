@@ -242,47 +242,41 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
 
     int ok = -1;
 
-    /* 主路径：原厂视频硬解链路 (libmedia_navi_api.so 的 media_navi_open)。
-       这是设备自带"学习"应用播在线视频的同款接口：内部经 send_service_cmd 把
-       播放指令发给常驻的 smart_player 服务，由它走 libve 硬解并渲染到屏幕（出画）。
-       注意：mp_*（libmusic_player_api.so）只是音频库，只能出声、绝不出画，
-       所以绝不能再当作主路径——那正是之前黑屏的根因。 */
-    if (mcp->media_navi_open)
+    /* 主路径：工厂硬解库 libsmart_player_api.so 的 splayer_*。
+       这是设备自带"学习"应用(learn.so)播视频的同款接口：splayer_set_file(url)
+       把 URL 交给常驻的 smart_player 服务——实测 smart_player 能正确收到指令
+       （其日志可见 [SPLAYER] cmd:stop 等），splayer_play() 启动 libve 硬解并
+       渲染到屏幕视频层。
+       注：media_navi_open 在本进程实测不会真正触发 smart_player 出画（dmesg
+       中无任何 play/url/decode 反应），故降级为备选。mp_* 只是音频库，仅兜底出声。 */
+    if (mcp->splayer_set_file && mcp->splayer_play)
     {
-        mcp->media_navi_open(url);
-        PLOG_I("TV", "media_navi_open 播放(视频): %s", url);
-        ok = 0;
-    }
-    else
-    {
-        PLOG_W("TV", "media_navi_open 不可用，回退 splayer_*");
-    }
-
-    if (ok != 0)
-    {
-        /* 兜底A：工厂硬解库 libsmart_player_api.so 的 splayer_*（把 URL 发给
-           smart_player 服务，由它 media_navi_open 出画）。 */
-        if (!mcp->splayer_set_file || !mcp->splayer_play)
-        {
-            PLOG_E("TV", "播放失败：media_navi_open 与 splayer 均不可用");
-            g_tv_playing = 0;
-            pthread_mutex_unlock(&g_tv_mutex);
-            return -1;
-        }
         if (mcp->splayer_open)
             mcp->splayer_open();
         mcp->splayer_set_file(url);
         if (mcp->splayer_set_volume)
             mcp->splayer_set_volume(TV_DEFAULT_VOL);
-        mcp->splayer_play();
-        PLOG_I("TV", "splayer_* 播放(视频兜底): %s", url);
+        int r = mcp->splayer_play();
+        PLOG_I("TV", "splayer_* 播放(视频主路径): %s (play ret=%d)", url, r);
         ok = 0;
+    }
+    else
+    {
+        PLOG_W("TV", "splayer_* 不可用，尝试 media_navi_open 备选");
+    }
+
+    if (ok != 0 && mcp->media_navi_open)
+    {
+        /* 备选：media_navi_open（部分在线媒体导航列表场景使用） */
+        int r = mcp->media_navi_open(url);
+        PLOG_I("TV", "media_navi_open 播放(视频备选): %s (ret=%d)", url, r);
+        if (r == 0)
+            ok = 0;
     }
 
     if (ok != 0)
     {
-        /* 最终兜底：流媒体核心 API (libmusic_player_api.so 的 mp_*)——仅出声
-           （音频库），用于以上两条视频链路都不可用时的降级，至少能听到。 */
+        /* 最终兜底：音频库 mp_*，仅出声，保证至少能听到 */
         if (mcp->mp_open && mcp->mp_set_file && mcp->mp_play)
         {
             void *h = mcp->mp_open();
