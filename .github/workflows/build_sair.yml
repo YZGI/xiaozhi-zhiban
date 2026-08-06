@@ -87,3 +87,19 @@ jobs:
           files: device/assistant/prebuilt/sair
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 将编译产物 sair 提交进仓库 ci-artifacts/，便于沙箱环境经 Contents API
+      # (api.github.com，代理可放行) 拉取并热更新到设备。路径不在 device/** 触发
+      # 范围内，且提交信息含 [skip ci]，不会再次触发本工作流。
+      - name: Publish sair binary into repo (ci-artifacts) for sandboxed deploy
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -x
+          mkdir -p ci-artifacts
+          cp device/assistant/prebuilt/sair ci-artifacts/sair
+          git config user.email "ci@github.com"
+          git config user.name "github-actions[bot]"
+          git add -f ci-artifacts/sair
+          git commit -m "[skip ci] publish sair binary (ci-artifacts)" || true
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/YZGI/xiaozhi-zhiban.git HEAD:develop
