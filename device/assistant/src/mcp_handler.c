@@ -38,6 +38,14 @@ static pthread_mutex_t g_tv_mutex;
 #ifndef TV_DEFAULT_VOL
 #define TV_DEFAULT_VOL 30
 #endif
+/* smart_player 播放模式：设备默认(未设)走 aimusic 音频引擎，splayer_set_file
+   会把 URL 当音频去解析 → music_decoder "parser header fail"。工厂"看电视"先用
+   splayer_set_mode(SPLAYER_MODE_OLMEDIA) 切到视频引擎再 set_file。该枚举值随固件
+   不同，故默认值仅为猜测，可在设备 /var/upgrade/tv_mode.txt 写入整数覆盖（无需重编）。 */
+#ifndef TV_SPLAYER_MODE_DEFAULT
+#define TV_SPLAYER_MODE_DEFAULT 2
+#endif
+#define TV_MODE_FILE "/var/upgrade/tv_mode.txt"
 
 /* 动态加载符号的宏，加载失败时输出警告日志 */
 #define LOAD_SYM(h, name, type)                     \
@@ -110,6 +118,7 @@ int mcp_handler_init(mcp_handler_t *mcp)
         LOAD_SYM(mcp->player_handle, splayer_set_file, int (*)(const char *));
         LOAD_SYM(mcp->player_handle, splayer_play, int (*)(void));
         LOAD_SYM(mcp->player_handle, splayer_set_volume, int (*)(int));
+        LOAD_SYM(mcp->player_handle, splayer_set_mode, int (*)(int));
         PLOG_I("MCP", "已加载 libsmart_player_api.so");
     }
     else
@@ -288,8 +297,31 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
        误判。本次把它设为绝对主路径，确保真正下发播放命令。 */
     if (mcp->splayer_set_file && mcp->splayer_play)
     {
+        /* 读取设备本地模式覆盖（用于定位 SPLAYER_MODE_OLMEDIA 真实枚举值，
+           避免每换一个猜测值就重编固件）。文件不存在则用编译期默认值。 */
+        int tv_mode = TV_SPLAYER_MODE_DEFAULT;
+        FILE *mf = fopen(TV_MODE_FILE, "r");
+        if (mf)
+        {
+            if (fscanf(mf, "%d", &tv_mode) == 1)
+                PLOG_I("TV", "tv_mode 覆盖文件=%s -> mode=%d", TV_MODE_FILE, tv_mode);
+            else
+                PLOG_W("TV", "tv_mode 覆盖文件格式错误，使用默认 %d", tv_mode);
+            fclose(mf);
+        }
         if (mcp->splayer_open)
             mcp->splayer_open();
+        /* 关键：先把渲染引擎切到视频模式(olmedia)，否则 set_file 会落入 aimusic
+           音频引擎(music_decoder 把 .ts 当音频解析 → parser header fail)。 */
+        if (mcp->splayer_set_mode)
+        {
+            int sm = mcp->splayer_set_mode(tv_mode);
+            PLOG_I("TV", "splayer_set_mode(%d) ret=%d", tv_mode, sm);
+        }
+        else
+        {
+            PLOG_W("TV", "splayer_set_mode 接口缺失，维持默认(音频)引擎 —— 可能不出画");
+        }
         int sf = mcp->splayer_set_file(url);
         PLOG_I("TV", "splayer_set_file: %s (ret=%d)", url, sf);
         if (mcp->splayer_set_volume)

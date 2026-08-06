@@ -27,6 +27,7 @@ typedef struct {
     int (*splayer_set_file)(const char *url);
     int (*splayer_play)(void);
     int (*splayer_set_volume)(int vol);
+    int (*splayer_set_mode)(int mode);
 
     /* 流媒体核心播放库 (libmusic_player_api.so)。这是学习软件/原厂播放器
        smart_player 真正用来播在线流的接口（mp_open 自启播放器服务并返回句柄，
