@@ -12,6 +12,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,3 +75,15 @@ jobs:
           name: sair
           path: device/assistant/prebuilt/sair
           if-no-files-found: error
+
+      # 同时发布为 Release asset：artifact 下载需 actions:read scope（当前 token 无），
+      # 而 Release asset 仅需 repo scope，便于本地部署脚本稳定拉取。
+      - name: Publish sair to Release (sair-latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sair-latest
+          name: sair build (latest)
+          body: "Automated sair build from develop. Commit ${{ github.sha }}."
+          files: device/assistant/prebuilt/sair
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
