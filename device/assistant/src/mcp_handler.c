@@ -205,43 +205,37 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
 #if TV_USE_MEDIA_NAVI
     if (mcp->media_navi_open)
     {
-        /* 设备原厂媒体导航：走 olmedia_service 守护 + 缓冲 UI（学习软件同款） */
+        /* 设备原厂媒体导航：学习软件播视频同款入口（内部耦合 olmedia_service 拉流）。
+           注意：media_navi_open 对 http url 返回 0 仅表示"请求被接受"，不代表已出画；
+           故此处只打日志，不单独据其返回置 ok，避免误判成功（详见逆向结论）。 */
         int r = mcp->media_navi_open(url);
-        if (r == 0)
-        {
-            ok = 0;
-            PLOG_I("TV", "media_navi_open 成功: %s", url);
-        }
-        else
-        {
-            PLOG_W("TV", "media_navi_open 返回 %d，回退 splayer_*", r);
-        }
+        PLOG_I("TV", "media_navi_open 返回 %d: %s", r, url);
     }
     else
     {
-        PLOG_W("TV", "media_navi_open 符号缺失，回退 splayer_*");
+        PLOG_W("TV", "media_navi_open 符号缺失，仅走 splayer_*");
     }
 #endif
 
-    if (ok != 0)
+    /* 统一用工厂硬解库 libsmart_player_api.so 的 splayer_* 真正播放。
+       splayer_set_file + splayer_play 是 smart_player 渲染进程对外暴露的播放 API，
+       内部经 libstream_source 拉流解码（支持 http/rtsp）。必须在 sair（含 applib 上下文）
+       内调用。无论 media_navi 结果如何都执行，确保真正出画。 */
+    if (!mcp->splayer_set_file || !mcp->splayer_play)
     {
-        /* 兜底：直接使用工厂硬解库 libsmart_player_api.so 的 splayer_*。
-           注意：必须在 sair（框架主应用，含 applib 上下文）内调用，
-           裸命令行调用会因 applib_init 失败而无效。 */
-        if (!mcp->splayer_set_file || !mcp->splayer_play)
-        {
-            PLOG_E("TV", "播放失败：media_navi 与 splayer 均不可用");
-            return -1;
-        }
-        if (mcp->splayer_open)
-            mcp->splayer_open();
-        mcp->splayer_set_file(url);
-        if (mcp->splayer_set_volume)
-            mcp->splayer_set_volume(TV_DEFAULT_VOL);
-        mcp->splayer_play();
-        PLOG_I("TV", "splayer_* 播放: %s", url);
-        ok = 0;
+        PLOG_E("TV", "播放失败：splayer 接口不可用");
+        g_tv_playing = 0;
+        pthread_mutex_unlock(&g_tv_mutex);
+        return -1;
     }
+    if (mcp->splayer_open)
+        mcp->splayer_open();
+    mcp->splayer_set_file(url);
+    if (mcp->splayer_set_volume)
+        mcp->splayer_set_volume(TV_DEFAULT_VOL);
+    mcp->splayer_play();
+    PLOG_I("TV", "splayer_* 播放: %s", url);
+    ok = 0;
 
     g_tv_playing = (ok == 0) ? 1 : 0;
     pthread_mutex_unlock(&g_tv_mutex);

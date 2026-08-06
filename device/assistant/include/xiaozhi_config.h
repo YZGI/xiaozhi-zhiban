@@ -85,7 +85,7 @@
  */
 #ifndef TV_DEFAULT_URL
 /* 默认电视源（公开 HLS 测试流，请改成你的频道 m3u8/rtsp 地址，国内源更稳） */
-#define TV_DEFAULT_URL "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+#define TV_DEFAULT_URL "http://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
 #endif
 #ifndef TV_DEFAULT_VOL
 #define TV_DEFAULT_VOL 30
