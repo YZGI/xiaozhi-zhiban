@@ -277,25 +277,58 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
 
     int ok = -1;
 
-    /* 测试主路径：media_navi_open(url) 发往 msg_server(pid 157) 媒体浏览/播放服务。
-       此前误判其为 no-op，是因当时只看了 smart_player 的 dmesg、没看 msg_server
-       自身反应。本测试置为首路径并捕获 msg_server(157) dmesg，验证其能否直接播
-       任意 URL（ts/hls）。若其返回 0 即视为出画链路已启动。 */
-    if (mcp->media_navi_open)
+    /* ===== 主路径 (Path A: 直连 smart_player 视频层) =====
+       逆向结论：smart_player(pid 207) 就是工厂"看电视"真正出画的渲染守护，它经
+       libsmart_player_api.so 暴露 splayer_open/set_file/set_playlist/play/stop 等
+       接口，每个接口 = send_service_cmd("smart_player", cmd, payload)。splayer_set_file
+       会把 URL 直接下发给渲染进程硬解并渲染到屏幕视频层，绕过云锁定的 olmedia_service
+       / msg_server（这两者只会拉厂商云目录、忽略任意 URL）。
+       此前把 media_navi_open 放在首路径，它会"假成功"(返回0) 从而短路掉本路径，
+       导致 splayer_set_file+play 实际从未在设备上跑过 —— 所谓"splayer 仅出声"是
+       误判。本次把它设为绝对主路径，确保真正下发播放命令。 */
+    if (mcp->splayer_set_file && mcp->splayer_play)
     {
-        int r = mcp->media_navi_open(url);
-        PLOG_I("TV", "media_navi_open 播放(测试主路径): %s (ret=%d)", url, r);
-        if (r == 0)
+        if (mcp->splayer_open)
+            mcp->splayer_open();
+        int sf = mcp->splayer_set_file(url);
+        PLOG_I("TV", "splayer_set_file: %s (ret=%d)", url, sf);
+        if (mcp->splayer_set_volume)
+            mcp->splayer_set_volume(TV_DEFAULT_VOL);
+        int sp = mcp->splayer_play();
+        PLOG_I("TV", "splayer_play(ret=%d)", sp);
+        if (sp == 0)
             ok = 0;
     }
     else
     {
-        PLOG_W("TV", "media_navi_open 不可用，降级 olmedia/splayer/mp 兜底");
+        PLOG_W("TV", "splayer_* 接口缺失，降级 mp/media_navi/olmedia 兜底");
     }
 
-    /* 兜底1：olmedia_api_open 发往 olmedia_service 云目录。实测它忽略任意 URL、
-       只拉厂商云目录(customCollectMediaPage)，故作为兜底；media_navi 失败时会
-       触发其云目录拉取（不影响本次对 media_navi 的判断）。 */
+    /* ===== 兜底（仅当 splayer 接口不可用，或出画失败时人工回退） =====
+       这些路径此前已逐一验证：media_navi_open 发往 msg_server 对本进程为 no-op；
+       olmedia_api_open 只拉厂商云目录、忽略任意 URL；mp_* 仅出声。故仅作最后的
+       可用性兜底，不作为出画主路径。 */
+    if (ok != 0 && mcp->mp_open && mcp->mp_set_file && mcp->mp_play)
+    {
+        void *h = mcp->mp_open();
+        if (h)
+        {
+            g_tv_handle = h;
+            mcp->mp_set_file(h, url);
+            if (mcp->mp_set_volume)
+                mcp->mp_set_volume(h, TV_DEFAULT_VOL);
+            mcp->mp_play(h);
+            PLOG_I("TV", "mp_* 播放(音频兜底): %s", url);
+            ok = 0;
+        }
+    }
+    if (ok != 0 && mcp->media_navi_open)
+    {
+        int r = mcp->media_navi_open(url);
+        PLOG_I("TV", "media_navi_open(兜底): %s (ret=%d)", url, r);
+        if (r == 0)
+            ok = 0;
+    }
     if (ok != 0 && mcp->olmedia_api_open)
     {
         int h = mcp->olmedia_api_open(url);
@@ -304,48 +337,6 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
         {
             g_olmedia_handle = h;
             ok = 0;
-        }
-    }
-
-    if (ok != 0 && mcp->splayer_set_file && mcp->splayer_play)
-    {
-        /* 兜底1：splayer_*（实测走 smart_player 音频 musicplayer 引擎，可能仅出声） */
-        if (mcp->splayer_open)
-            mcp->splayer_open();
-        mcp->splayer_set_file(url);
-        if (mcp->splayer_set_volume)
-            mcp->splayer_set_volume(TV_DEFAULT_VOL);
-        int r = mcp->splayer_play();
-        PLOG_I("TV", "splayer_* 播放(兜底): %s (play ret=%d)", url, r);
-        if (r == 0)
-            ok = 0;
-    }
-
-    if (ok != 0 && mcp->media_navi_open)
-    {
-        /* 兜底2：media_navi_open（发往 msg_server，对本进程实测为 no-op） */
-        int r = mcp->media_navi_open(url);
-        PLOG_I("TV", "media_navi_open 播放(兜底): %s (ret=%d)", url, r);
-        if (r == 0)
-            ok = 0;
-    }
-
-    if (ok != 0)
-    {
-        /* 兜底3：音频库 mp_*，仅出声，保证至少能听到 */
-        if (mcp->mp_open && mcp->mp_set_file && mcp->mp_play)
-        {
-            void *h = mcp->mp_open();
-            if (h)
-            {
-                g_tv_handle = h;
-                mcp->mp_set_file(h, url);
-                if (mcp->mp_set_volume)
-                    mcp->mp_set_volume(h, TV_DEFAULT_VOL);
-                mcp->mp_play(h);
-                PLOG_I("TV", "mp_* 播放(音频兜底): %s", url);
-                ok = 0;
-            }
         }
     }
 
