@@ -286,44 +286,31 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
 
     int ok = -1;
 
-    /* ===== 主路径 (Path A: 直连 smart_player 视频层) =====
-       逆向结论：smart_player(pid 207) 就是工厂"看电视"真正出画的渲染守护，它经
-       libsmart_player_api.so 暴露 splayer_open/set_file/set_playlist/play/stop 等
-       接口，每个接口 = send_service_cmd("smart_player", cmd, payload)。splayer_set_file
-       会把 URL 直接下发给渲染进程硬解并渲染到屏幕视频层，绕过云锁定的 olmedia_service
-       / msg_server（这两者只会拉厂商云目录、忽略任意 URL）。
-       此前把 media_navi_open 放在首路径，它会"假成功"(返回0) 从而短路掉本路径，
-       导致 splayer_set_file+play 实际从未在设备上跑过 —— 所谓"splayer 仅出声"是
-       误判。本次把它设为绝对主路径，确保真正下发播放命令。 */
-    if (mcp->splayer_set_file && mcp->splayer_play)
+    /* ===== 主路径 (Path V: media_navi_open 视频硬解，工厂“学习软件”同款) =====
+       实机双验证(GS705B_video_scene_reverse.md)：smart_player 经 libmedia_navi_api.so
+       的 media_navi_open(url) 走 libve 硬解渲染到屏幕视频层，是真正的出画链路；
+       splayer_set_file / mp_* 仅音频（splayer_set_mode 任何值 0~16 实测都落
+       music_decoder 音频解码 → parser header fail，视频模式经 splayer 不可达）。
+       故 media_navi_open 作绝对主路径。 */
+    if (mcp->media_navi_open)
     {
-        /* 读取设备本地模式覆盖（用于定位 SPLAYER_MODE_OLMEDIA 真实枚举值，
-           避免每换一个猜测值就重编固件）。文件不存在则用编译期默认值。 */
-        int tv_mode = TV_SPLAYER_MODE_DEFAULT;
-        FILE *mf = fopen(TV_MODE_FILE, "r");
-        if (mf)
-        {
-            if (fscanf(mf, "%d", &tv_mode) == 1)
-                PLOG_I("TV", "tv_mode 覆盖文件=%s -> mode=%d", TV_MODE_FILE, tv_mode);
-            else
-                PLOG_W("TV", "tv_mode 覆盖文件格式错误，使用默认 %d", tv_mode);
-            fclose(mf);
-        }
+        int r = mcp->media_navi_open(url);
+        PLOG_I("TV", "media_navi_open 播放(视频): %s (ret=%d)", url, r);
+        if (r == 0)
+            ok = 0;
+    }
+    else
+    {
+        PLOG_W("TV", "media_navi_open 接口缺失，降级 splayer/mp 兜底");
+    }
+
+    /* ===== 兜底A: splayer_set_file/play (仍经 smart_player 视频渲染，但实测 .ts 会落音频解码) ===== */
+    if (ok != 0 && mcp->splayer_set_file && mcp->splayer_play)
+    {
         if (mcp->splayer_open)
             mcp->splayer_open();
-        /* 关键：先把渲染引擎切到视频模式(olmedia)，否则 set_file 会落入 aimusic
-           音频引擎(music_decoder 把 .ts 当音频解析 → parser header fail)。 */
-        if (mcp->splayer_set_mode)
-        {
-            int sm = mcp->splayer_set_mode(tv_mode);
-            PLOG_I("TV", "splayer_set_mode(%d) ret=%d", tv_mode, sm);
-        }
-        else
-        {
-            PLOG_W("TV", "splayer_set_mode 接口缺失，维持默认(音频)引擎 —— 可能不出画");
-        }
         int sf = mcp->splayer_set_file(url);
-        PLOG_I("TV", "splayer_set_file: %s (ret=%d)", url, sf);
+        PLOG_I("TV", "splayer_set_file(兜底A): %s (ret=%d)", url, sf);
         if (mcp->splayer_set_volume)
             mcp->splayer_set_volume(TV_DEFAULT_VOL);
         int sp = mcp->splayer_play();
@@ -331,15 +318,7 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
         if (sp == 0)
             ok = 0;
     }
-    else
-    {
-        PLOG_W("TV", "splayer_* 接口缺失，降级 mp/media_navi/olmedia 兜底");
-    }
-
-    /* ===== 兜底（仅当 splayer 接口不可用，或出画失败时人工回退） =====
-       这些路径此前已逐一验证：media_navi_open 发往 msg_server 对本进程为 no-op；
-       olmedia_api_open 只拉厂商云目录、忽略任意 URL；mp_* 仅出声。故仅作最后的
-       可用性兜底，不作为出画主路径。 */
+    /* ===== 兜底B: mp_* (仅出声) ===== */
     if (ok != 0 && mcp->mp_open && mcp->mp_set_file && mcp->mp_play)
     {
         void *h = mcp->mp_open();
@@ -353,13 +332,6 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
             PLOG_I("TV", "mp_* 播放(音频兜底): %s", url);
             ok = 0;
         }
-    }
-    if (ok != 0 && mcp->media_navi_open)
-    {
-        int r = mcp->media_navi_open(url);
-        PLOG_I("TV", "media_navi_open(兜底): %s (ret=%d)", url, r);
-        if (r == 0)
-            ok = 0;
     }
     if (ok != 0 && mcp->olmedia_api_open)
     {
