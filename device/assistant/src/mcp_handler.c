@@ -51,6 +51,9 @@ static pthread_mutex_t g_tv_mutex;
 /* 看电视播放状态（供 main.c 抑制 AI 播报，避免与原声冲突） */
 static int g_tv_playing = 0;
 
+/* mp_* 播放器句柄（mp_open 返回，跨 play/stop 复用，stop 时关闭） */
+static void *g_tv_handle = NULL;
+
 /**
  * @brief 初始化MCP处理器
  * @param mcp MCP处理器实例指针
@@ -111,6 +114,27 @@ int mcp_handler_init(mcp_handler_t *mcp)
         PLOG_W("MCP", "加载 libsmart_player_api.so 失败: %s", dlerror());
     }
 
+    /* 加载流媒体核心播放库 (libmusic_player_api.so)：smart_player / 学习软件
+       真正播在线流的接口，支持 http/hls/rtsp 拉流。mp_open 自启播放器服务。 */
+    mcp->music_handle = dlopen("libmusic_player_api.so", RTLD_NOW);
+    if (mcp->music_handle)
+    {
+        LOAD_SYM(mcp->music_handle, mp_open, void *(*)(void));
+        LOAD_SYM(mcp->music_handle, mp_close, int (*)(void *));
+        LOAD_SYM(mcp->music_handle, mp_set_file, int (*)(void *, const char *));
+        LOAD_SYM(mcp->music_handle, mp_play, int (*)(void *));
+        LOAD_SYM(mcp->music_handle, mp_stop, int (*)(void *));
+        LOAD_SYM(mcp->music_handle, mp_pause, int (*)(void *));
+        LOAD_SYM(mcp->music_handle, mp_resume, int (*)(void *));
+        LOAD_SYM(mcp->music_handle, mp_set_volume, int (*)(void *, int));
+        PLOG_I("MCP", "已加载 libmusic_player_api.so (mp_open=%s)",
+               mcp->mp_open ? "ok" : "缺失");
+    }
+    else
+    {
+        PLOG_W("MCP", "加载 libmusic_player_api.so 失败: %s (看电视将走 splayer 兜底)", dlerror());
+    }
+
     /* 加载设备原厂媒体导航库 (libmedia_navi_api.so，学习软件播视频同款，
        走 olmedia_service 守护 + 缓冲 UI)。TV_USE_MEDIA_NAVI=1 时优先用于看电视。 */
     mcp->navi_handle = dlopen("libmedia_navi_api.so", RTLD_NOW);
@@ -143,6 +167,11 @@ void mcp_handler_destroy(mcp_handler_t *mcp)
         dlclose(mcp->player_handle);
         mcp->player_handle = NULL;
     }
+    if (mcp->music_handle)
+    {
+        dlclose(mcp->music_handle);
+        mcp->music_handle = NULL;
+    }
     if (mcp->navi_handle)
     {
         dlclose(mcp->navi_handle);
@@ -171,14 +200,16 @@ int mcp_stop_tv(mcp_handler_t *mcp)
 {
     int ret = -1;
     pthread_mutex_lock(&g_tv_mutex);
-#if TV_USE_MEDIA_NAVI
-    if (mcp && mcp->media_navi_close)
+    /* 主路径：关闭 mp_* 播放器句柄（若上一轮用 mp_* 播的） */
+    if (g_tv_handle && mcp && mcp->mp_stop)
     {
-        mcp->media_navi_close();
+        mcp->mp_stop(g_tv_handle);
+        if (mcp->mp_close)
+            mcp->mp_close(g_tv_handle);
+        g_tv_handle = NULL;
         ret = 0;
-        PLOG_I("TV", "停止播放 (media_navi_close)");
+        PLOG_I("TV", "停止播放 (mp_stop/mp_close)");
     }
-#endif
     if (ret != 0 && mcp && mcp->splayer_stop)
     {
         mcp->splayer_stop();
@@ -198,44 +229,57 @@ int mcp_play_tv(mcp_handler_t *mcp, const char *url)
     if (!url || url[0] == '\0')
         url = TV_DEFAULT_URL;
 
-    /* 先停掉上一路，避免画面/音频叠加 */
+    /* 先停掉上一路，避免画面/音频叠加（递归锁，内部再加锁安全） */
     mcp_stop_tv(mcp);
 
     int ok = -1;
-#if TV_USE_MEDIA_NAVI
-    if (mcp->media_navi_open)
+
+    /* 主路径：流媒体核心 api (libmusic_player_api.so 的 mp_*)。
+       这是学习软件/原厂播放器 smart_player 真正播在线流的接口，支持 http/hls/rtsp。
+       mp_open 自启播放器服务并返回句柄，mp_set_file 设流地址，mp_play 出画。
+       注意：必须在 sair（框架主应用，含 applib 上下文）内调用。 */
+    if (mcp->mp_open && mcp->mp_set_file && mcp->mp_play)
     {
-        /* 设备原厂媒体导航：学习软件播视频同款入口（内部耦合 olmedia_service 拉流）。
-           注意：media_navi_open 对 http url 返回 0 仅表示"请求被接受"，不代表已出画；
-           故此处只打日志，不单独据其返回置 ok，避免误判成功（详见逆向结论）。 */
-        int r = mcp->media_navi_open(url);
-        PLOG_I("TV", "media_navi_open 返回 %d: %s", r, url);
+        void *h = mcp->mp_open();
+        if (h)
+        {
+            g_tv_handle = h;
+            mcp->mp_set_file(h, url);
+            if (mcp->mp_set_volume)
+                mcp->mp_set_volume(h, TV_DEFAULT_VOL);
+            mcp->mp_play(h);
+            PLOG_I("TV", "mp_* 播放: %s", url);
+            ok = 0;
+        }
+        else
+        {
+            PLOG_W("TV", "mp_open 返回空句柄，回退 splayer_*");
+        }
     }
     else
     {
-        PLOG_W("TV", "media_navi_open 符号缺失，仅走 splayer_*");
+        PLOG_W("TV", "mp_* 不可用，回退 splayer_*");
     }
-#endif
 
-    /* 统一用工厂硬解库 libsmart_player_api.so 的 splayer_* 真正播放。
-       splayer_set_file + splayer_play 是 smart_player 渲染进程对外暴露的播放 API，
-       内部经 libstream_source 拉流解码（支持 http/rtsp）。必须在 sair（含 applib 上下文）
-       内调用。无论 media_navi 结果如何都执行，确保真正出画。 */
-    if (!mcp->splayer_set_file || !mcp->splayer_play)
+    if (ok != 0)
     {
-        PLOG_E("TV", "播放失败：splayer 接口不可用");
-        g_tv_playing = 0;
-        pthread_mutex_unlock(&g_tv_mutex);
-        return -1;
+        /* 兜底：工厂硬解库 libsmart_player_api.so 的 splayer_*（本地文件型，在线流未必可用） */
+        if (!mcp->splayer_set_file || !mcp->splayer_play)
+        {
+            PLOG_E("TV", "播放失败：mp_* 与 splayer 均不可用");
+            g_tv_playing = 0;
+            pthread_mutex_unlock(&g_tv_mutex);
+            return -1;
+        }
+        if (mcp->splayer_open)
+            mcp->splayer_open();
+        mcp->splayer_set_file(url);
+        if (mcp->splayer_set_volume)
+            mcp->splayer_set_volume(TV_DEFAULT_VOL);
+        mcp->splayer_play();
+        PLOG_I("TV", "splayer_* 播放(兜底): %s", url);
+        ok = 0;
     }
-    if (mcp->splayer_open)
-        mcp->splayer_open();
-    mcp->splayer_set_file(url);
-    if (mcp->splayer_set_volume)
-        mcp->splayer_set_volume(TV_DEFAULT_VOL);
-    mcp->splayer_play();
-    PLOG_I("TV", "splayer_* 播放: %s", url);
-    ok = 0;
 
     g_tv_playing = (ok == 0) ? 1 : 0;
     pthread_mutex_unlock(&g_tv_mutex);

@@ -28,8 +28,23 @@ typedef struct {
     int (*splayer_play)(void);
     int (*splayer_set_volume)(int vol);
 
-    /* 设备原厂媒体导航库 (libmedia_navi_api.so, 学习软件播放视频同款,
-       走 olmedia_service 守护 + 缓冲 UI；TV_USE_MEDIA_NAVI=1 时优先) */
+    /* 流媒体核心播放库 (libmusic_player_api.so)。这是学习软件/原厂播放器
+       smart_player 真正用来播在线流的接口（mp_open 自启播放器服务并返回句柄，
+       mp_set_file 设流地址，mp_play 出画），支持 http/hls/rtsp 拉流。
+       splayer_* 只是其本地文件型封装，播 http 流会走错分支（实测 msg->type:0）。
+       看电视主路径用 mp_*，splayer_* 仅作兜底。 */
+    void *music_handle;
+    void *(*mp_open)(void);
+    int (*mp_close)(void *);
+    int (*mp_set_file)(void *, const char *);
+    int (*mp_play)(void *);
+    int (*mp_stop)(void *);
+    int (*mp_pause)(void *);
+    int (*mp_resume)(void *);
+    int (*mp_set_volume)(void *, int);
+
+    /* 设备原厂媒体导航库 (libmedia_navi_api.so, 走 olmedia_service 云目录，
+       仅能播厂商云目录条目，不能播任意 URL，已弃用为播放主路径) */
     void *navi_handle;
     int (*media_navi_open)(const char *url);
     int (*media_navi_close)(void);
